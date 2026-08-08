@@ -1,0 +1,10 @@
+# dependencies
+
+torch
+torchvision
+numpy
+nibabel        # for reading .nii CT files
+SimpleITK      # for medical image processing
+scikit-image   # for preprocessing
+matplotlib     # for visualizing results
+tqdm           # progress bars
