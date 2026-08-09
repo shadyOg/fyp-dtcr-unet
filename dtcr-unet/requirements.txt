@@ -8,3 +8,5 @@ SimpleITK      # for medical image processing
 scikit-image   # for preprocessing
 matplotlib     # for visualizing results
 tqdm           # progress bars
+kaggle         # Kaggle CLI for dataset download
+imageio        # image reading for PNG/JPG support
