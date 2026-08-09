@@ -13,10 +13,10 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=0, bias=False),
             nn.BatchNorm2d(mid_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=0, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
@@ -56,14 +56,22 @@ class Up(nn.Module):
     def forward(self, x1, x2):
         x1 = self.up(x1)
         # input is CHW
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
+        # Original UNet used unpadded convs and cropped the skip connection
+        # to match the upsampled feature map size. Do the same here.
+        h1, w1 = x1.size(2), x1.size(3)
+        h2, w2 = x2.size(2), x2.size(3)
 
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
-        # if you have padding issues, see
-        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
-        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        # if skip feature map is larger, center-crop it
+        if h2 > h1 or w2 > w1:
+            dh = (h2 - h1) // 2
+            dw = (w2 - w1) // 2
+            x2 = x2[:, :, dh:dh + h1, dw:dw + w1]
+        elif h1 > h2 or w1 > w2:
+            # fallback: pad x2 if it's smaller (unlikely for typical UNet shapes)
+            pad_h = h1 - h2
+            pad_w = w1 - w2
+            x2 = F.pad(x2, [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2])
+
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 

@@ -10,6 +10,9 @@ class UNet(nn.Module):
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.bilinear = bilinear
+        # checkpointing flag — when True, forward() will wrap selected
+        # module calls with torch.utils.checkpoint.checkpoint for memory savings.
+        self._use_checkpoint = False
 
         self.inc = (DoubleConv(n_channels, 64))
         self.down1 = (Down(64, 128))
@@ -24,26 +27,38 @@ class UNet(nn.Module):
         self.outc = (OutConv(64, n_classes))
 
     def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
+        # Use checkpointing wrappers if enabled. checkpoint.checkpoint requires
+        # functions that take tensors and return tensors, so we wrap modules.
+        if self._use_checkpoint:
+            x1 = torch.utils.checkpoint.checkpoint(self.inc, x)
+            x2 = torch.utils.checkpoint.checkpoint(self.down1, x1)
+            x3 = torch.utils.checkpoint.checkpoint(self.down2, x2)
+            x4 = torch.utils.checkpoint.checkpoint(self.down3, x3)
+            x5 = torch.utils.checkpoint.checkpoint(self.down4, x4)
+        else:
+            x1 = self.inc(x)
+            x2 = self.down1(x1)
+            x3 = self.down2(x2)
+            x4 = self.down3(x3)
+            x5 = self.down4(x4)
+        # For up blocks, checkpointing is less common but supported similarly
+        if self._use_checkpoint:
+            x = torch.utils.checkpoint.checkpoint(self.up1, x5, x4)
+            x = torch.utils.checkpoint.checkpoint(self.up2, x, x3)
+            x = torch.utils.checkpoint.checkpoint(self.up3, x, x2)
+            x = torch.utils.checkpoint.checkpoint(self.up4, x, x1)
+        else:
+            x = self.up1(x5, x4)
+            x = self.up2(x, x3)
+            x = self.up3(x, x2)
+            x = self.up4(x, x1)
         logits = self.outc(x)
         return logits
 
     def use_checkpointing(self):
-        self.inc = torch.utils.checkpoint(self.inc)
-        self.down1 = torch.utils.checkpoint(self.down1)
-        self.down2 = torch.utils.checkpoint(self.down2)
-        self.down3 = torch.utils.checkpoint(self.down3)
-        self.down4 = torch.utils.checkpoint(self.down4)
-        self.up1 = torch.utils.checkpoint(self.up1)
-        self.up2 = torch.utils.checkpoint(self.up2)
-        self.up3 = torch.utils.checkpoint(self.up3)
-        self.up4 = torch.utils.checkpoint(self.up4)
-        self.outc = torch.utils.checkpoint(self.outc)
+        """Enable checkpointing for the forward pass.
+
+        Call this before training to save memory (at the cost of extra
+        compute during the backward pass).
+        """
+        self._use_checkpoint = True
