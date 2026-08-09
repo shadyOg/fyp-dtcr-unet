@@ -44,6 +44,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', required=True, help='Path to dataset root')
+    parser.add_argument('--checkpoint', action='store_true', help='Enable activation checkpointing')
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -52,6 +53,8 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = UNet(n_channels=1, n_classes=1, bilinear=False).to(device)
+    if args.checkpoint:
+        model.use_checkpointing()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.BCEWithLogitsLoss()
 

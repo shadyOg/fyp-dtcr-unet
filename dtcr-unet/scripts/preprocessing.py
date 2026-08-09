@@ -39,6 +39,7 @@ import argparse
 import random
 import numpy as np
 import nibabel as nib
+from nibabel.nifti1 import Nifti1Image
 from glob import glob
 from pathlib import Path
 from skimage.transform import resize
@@ -61,6 +62,8 @@ np.random.seed(SEED)
 def load_nifti(path):
     """Load a .nii or .nii.gz file and return as numpy array."""
     vol = nib.load(str(path))
+    vol = nib.as_closest_canonical(vol)  # optional but good practice
+    assert isinstance(vol, Nifti1Image)  # tells Pylance the exact type
     return np.asarray(vol.get_fdata(), dtype=np.float32)
 
 

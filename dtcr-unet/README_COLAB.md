@@ -45,6 +45,12 @@ files.upload()  # choose kaggle.json
 !python /content/fyp-dtcr-unet/dtcr-unet/train_colab.py --data /content/mosmeddata --epochs 1 --batch-size 2
 ```
 
+Optional: enable activation checkpointing to reduce memory usage (slower backward pass):
+
+```bash
+!python /content/fyp-dtcr-unet/dtcr-unet/train_colab.py --data /content/mosmeddata --epochs 1 --batch-size 2 --checkpoint
+```
+
 Notes
 - The repository includes `data/mosmed_dataset.py` as a simple `Dataset` implementation. You may need to adapt file paths depending on how the Kaggle dataset is structured after extraction.
 - If you want GPU/CUDA, in Colab enable `Runtime > Change runtime type > GPU`.
