@@ -22,7 +22,7 @@ class DiceLoss(nn.Module):
             pred: Predicted probabilities or sigmoid outputs of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        pred_safe = torch.clamp(pred, min=1e-6, max=1.0 - 1e-6)
+        pred_safe = torch.clamp(pred, min=1e-4, max=1.0 - 1e-4)
         pred_flat = pred_safe.contiguous().view(pred_safe.size(0), -1)
         target_flat = target.contiguous().view(target.size(0), -1)
 
@@ -34,9 +34,9 @@ class DiceLoss(nn.Module):
 
 
 class SupervisedSegLoss(nn.Module):
-    """Segmentation Loss with dominant Dice component to prevent background collapse."""
+    """Segmentation Loss with balanced BCE and Dice components to prevent background collapse."""
 
-    def __init__(self, bce_weight: float = 0.2, dice_weight: float = 1.0, smooth: float = 1.0):
+    def __init__(self, bce_weight: float = 1.0, dice_weight: float = 1.0, smooth: float = 1.0):
         super().__init__()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight

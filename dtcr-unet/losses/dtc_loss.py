@@ -22,16 +22,16 @@ def compute_spatial_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     return grad_x, grad_y
 
 
-def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int) -> float:
+def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int, max_weight: float = 0.1) -> float:
     """Calculate the Gaussian ramp-up consistency weight lambda_d(t).
 
     Per Eq. (10) of the paper:
-        lambda_d(t) = exp(-5 * (1 - t / t_max)^2)
+        lambda_d(t) = max_weight * exp(-5 * (1 - t / t_max)^2)
     """
     if max_epochs <= 0:
-        return 1.0
+        return max_weight
     t = min(current_epoch, max_epochs)
-    ramp = math.exp(-5.0 * ((1.0 - t / max_epochs) ** 2))
+    ramp = max_weight * math.exp(-5.0 * ((1.0 - t / max_epochs) ** 2))
     return float(ramp)
 
 

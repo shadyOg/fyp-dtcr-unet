@@ -25,48 +25,18 @@ from .msgs import MultiScaleGlobalSpatial
 from .mssc import MultiScaleSkipConnection
 
 
-def compute_gradient_norm(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute spatial gradient norms ||nabla z|| and ||nabla z||^2 using Sobel filters."""
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=z.dtype, device=z.device).view(1, 1, 3, 3) / 8.0
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=z.dtype, device=z.device).view(1, 1, 3, 3) / 8.0
-
-    pad_z = F.pad(z, (1, 1, 1, 1), mode="replicate")
-    grad_x = F.conv2d(pad_z, sobel_x)
-    grad_y = F.conv2d(pad_z, sobel_y)
-
-    grad_norm_sq = grad_x**2 + grad_y**2
-    grad_norm = torch.sqrt(grad_norm_sq + 1e-6)
-
-    return grad_norm, grad_norm_sq
-
-
 def inverse_level_set_transform(
     z: torch.Tensor,
     k: float = 1.0,
-    lambda1: float = 0.01,
-    lambda2: float = 0.01,
 ) -> torch.Tensor:
     """Differentiable inverse mapping T^{-1}(z) converting Level Set output back to segmentation space.
 
     Per Eq. (2) in the DTCR-U-Net paper:
-        T^{-1}(z) = sigma(k * z) + lambda1 * ||nabla z||^2 + lambda2 * ||nabla z||
-
-    Args:
-        z: Predicted Level Set map from Task 2 (shape: B, 1, H, W).
-        k: Sigmoid scaling constant.
-        lambda1: Gradient smoothing coefficient.
-        lambda2: Laplacian / first-order gradient coefficient.
-
-    Returns:
-        Transformed segmentation probability map (shape: B, 1, H, W) bounded in [0, 1].
+        T^{-1}(z) = sigma(-k * z)
+    Maps z < 0 (inside lesion) -> 1.0, z > 0 (background) -> 0.0.
     """
-    z_clamped = torch.clamp(z, -5.0, 5.0)
-    sig_z = torch.sigmoid(-k * z_clamped)
-
-    grad_norm, grad_norm_sq = compute_gradient_norm(z_clamped)
-    transformed = sig_z + lambda1 * grad_norm_sq + lambda2 * grad_norm
-
-    return torch.clamp(transformed, 0.0, 1.0)
+    z_clamped = torch.clamp(z, min=-10.0, max=10.0)
+    return torch.sigmoid(-k * z_clamped)
 
 
 class DTCR_UNet(nn.Module):

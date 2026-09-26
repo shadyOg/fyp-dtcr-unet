@@ -124,6 +124,49 @@ class DualTaskDataset(Dataset):
         }
 
 
+class TwoStreamBatchSampler(torch.utils.data.Sampler):
+    """Balanced two-stream batch sampler for semi-supervised training.
+
+    Ensures that every single training batch contains an exact balance of labeled
+    and unlabeled slices, preventing un-anchored consistency drift.
+    """
+
+    def __init__(
+        self,
+        primary_indices: List[int],
+        secondary_indices: List[int],
+        batch_size: int,
+        secondary_batch_size: int,
+    ):
+        self.primary_indices = primary_indices
+        self.secondary_indices = secondary_indices
+        self.secondary_batch_size = secondary_batch_size
+        self.primary_batch_size = batch_size - secondary_batch_size
+        assert self.primary_batch_size > 0, "Batch size must be greater than secondary batch size"
+        assert len(self.primary_indices) > 0, "Primary indices cannot be empty"
+        assert len(self.secondary_indices) > 0, "Secondary indices cannot be empty"
+
+    def __iter__(self):
+        primary_perm = np.random.permutation(self.primary_indices).tolist()
+        secondary_perm = np.random.permutation(self.secondary_indices).tolist()
+
+        # Infinite generator for secondary (unlabeled) stream
+        sec_idx = 0
+        for i in range(0, len(primary_perm) - self.primary_batch_size + 1, self.primary_batch_size):
+            p_batch = primary_perm[i : i + self.primary_batch_size]
+            s_batch = []
+            while len(s_batch) < self.secondary_batch_size:
+                if sec_idx >= len(secondary_perm):
+                    secondary_perm = np.random.permutation(self.secondary_indices).tolist()
+                    sec_idx = 0
+                s_batch.append(secondary_perm[sec_idx])
+                sec_idx += 1
+            yield p_batch + s_batch
+
+    def __len__(self) -> int:
+        return len(self.primary_indices) // self.primary_batch_size
+
+
 def get_dataloaders(
     data_dir: Union[str, Path],
     batch_size: int = 16,
@@ -150,14 +193,33 @@ def get_dataloaders(
         transform=False,
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True if len(train_ds) > batch_size else False,
-    )
+    if labeled_ratio < 1.0 and batch_size >= 2:
+        labeled_idxs = [i for i, lab in enumerate(train_ds.is_labeled_list) if lab]
+        unlabeled_idxs = [i for i, lab in enumerate(train_ds.is_labeled_list) if not lab]
+        sec_batch = max(1, batch_size // 2)
+
+        batch_sampler = TwoStreamBatchSampler(
+            primary_indices=labeled_idxs,
+            secondary_indices=unlabeled_idxs,
+            batch_size=batch_size,
+            secondary_batch_size=sec_batch,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True if len(train_ds) > batch_size else False,
+        )
+
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
