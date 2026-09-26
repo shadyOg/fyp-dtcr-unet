@@ -302,240 +302,367 @@ def process_mosmed_dataset(
     return manifest
 
 
-def find_lidc_pairs(lidc_root: str) -> List[Tuple[Path, Path, str]]:
-    """Discover LIDC-IDRI image/mask pairs from the washingtongold/lidcidri30 dataset.
-
-    Expected structure (Kaggle: washingtongold/lidcidri30):
-        seg_LIDC-IDRI/
-          LIDC-IDRI-0001/
-            nodule_01/
-              slice_001/
-                slice.png      <- CT image
-                MV05.png       <- majority vote mask (>=50% annotators)
-    
-    Also supports the shuyueg/lidc-idri-byslices variant with same structure.
-    Falls back to generic *_mask*/*_seg* pattern matching if LIDC structure not found.
-    """
-    import re
-    root = Path(lidc_root)
-    
-    # Strategy 1: Look for the specific seg_LIDC-IDRI directory structure
-    seg_dirs = list(root.rglob("seg_LIDC-IDRI"))
-    if not seg_dirs:
-        # Also try without the seg_ prefix
-        seg_dirs = list(root.rglob("LIDC-IDRI"))
-    
-    pairs = []
-    
-    if seg_dirs:
-        seg_dir = seg_dirs[0]
-        print(f"Found LIDC-IDRI structure at: {seg_dir}")
-        
-        for patient_dir in sorted(seg_dir.iterdir()):
-            if not patient_dir.is_dir():
+def _find_ct_series_folder(patient_path: Path) -> Optional[str]:
+    """Find the DICOM CT series folder under a patient directory."""
+    import SimpleITK as sitk
+    for root, dirs, files in os.walk(patient_path):
+        dcm_files = [f for f in files if f.endswith(".dcm")]
+        if len(dcm_files) > 10:  # CT series typically has many slices (>10)
+            try:
+                series_ids = sitk.ImageSeriesReader().GetGDCMSeriesIDs(root)
+                if series_ids:
+                    return root
+            except Exception:
                 continue
-            patient_id = patient_dir.name  # e.g., "LIDC-IDRI-0001"
-            
-            for nodule_dir in sorted(patient_dir.iterdir()):
-                if not nodule_dir.is_dir():
+    return None
+
+
+def _build_xml_uid_index(xml_root: str) -> Dict[str, str]:
+    """Build a SeriesInstanceUID -> XML file path lookup from LIDC XML annotations.
+    
+    Namespace-agnostic to handle various XML schema versions.
+    """
+    import xml.etree.ElementTree as ET
+    uid_map = {}
+
+    xml_dir = Path(xml_root)
+    xml_files = list(xml_dir.rglob("*.xml"))
+    print(f"  Indexing {len(xml_files)} XML annotation files...")
+
+    for xml_path in xml_files:
+        try:
+            tree = ET.parse(str(xml_path))
+            root = tree.getroot()
+            for elem in root.iter():
+                tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                if tag.lower() == "seriesinstanceuid" and elem.text:
+                    uid_map[elem.text.strip()] = str(xml_path)
+                    break
+        except Exception:
+            continue
+
+    print(f"  Indexed {len(uid_map)} SeriesInstanceUIDs.")
+    return uid_map
+
+
+def _extract_nodule_masks_from_xml(
+    xml_path: str,
+    ct_origin_z: float,
+    ct_spacing_z: float,
+    num_slices: int,
+    volume_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Parse LIDC XML and convert radiologist nodule contours to a 3D binary mask volume.
+
+    Uses majority voting: a voxel is positive if >= 2 radiologists marked it,
+    or >= 1 if only 1 radiologist marked any nodule.
+    """
+    import xml.etree.ElementTree as ET
+    from skimage.draw import polygon
+
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    # Accumulate votes from all reading sessions
+    vote_volume = np.zeros((num_slices, volume_shape[0], volume_shape[1]), dtype=np.int32)
+
+    for session in root.iter():
+        session_tag = session.tag.split("}")[-1] if "}" in session.tag else session.tag
+        if session_tag != "readingSession":
+            continue
+
+        for nodule in session.iter():
+            nodule_tag = nodule.tag.split("}")[-1] if "}" in nodule.tag else nodule.tag
+            if nodule_tag != "unblindedReadNodule":
+                continue
+
+            for roi in nodule.iter():
+                roi_tag = roi.tag.split("}")[-1] if "}" in roi.tag else roi.tag
+                if roi_tag != "roi":
                     continue
-                    
-                for slice_dir in sorted(nodule_dir.iterdir()):
-                    if not slice_dir.is_dir():
-                        continue
-                    
-                    # Look for image file (slice.png or similar)
-                    img_path = slice_dir / "slice.png"
-                    if not img_path.exists():
-                        # Try other common names
-                        for candidate in ["image.png", "img.png", "slice.jpg"]:
-                            img_path = slice_dir / candidate
-                            if img_path.exists():
-                                break
-                    
-                    # Look for mask file (MV05.png = majority vote >= 50%)
-                    mask_path = slice_dir / "MV05.png"
-                    if not mask_path.exists():
-                        # Try other mask names
-                        for candidate in ["mask.png", "seg.png", "MV50.png", "annotation.png"]:
-                            mask_path = slice_dir / candidate
-                            if mask_path.exists():
-                                break
-                    
-                    if img_path.exists() and mask_path.exists():
-                        pairs.append((img_path, mask_path, patient_id))
-        
-        if pairs:
-            return pairs
-    
-    # Strategy 2: Fallback - generic filename pattern matching
-    print("LIDC-IDRI seg directory not found, trying generic pattern matching...")
-    all_files = list(root.rglob("*.*"))
-    img_exts = {".png", ".jpg", ".bmp", ".npy", ".tif", ".tiff"}
-    
-    img_files = [f for f in all_files 
-                 if f.suffix.lower() in img_exts 
-                 and "mask" not in f.name.lower() 
-                 and "seg" not in f.name.lower()
-                 and "MV" not in f.name]
-    mask_files = [f for f in all_files 
-                  if f.suffix.lower() in img_exts 
-                  and ("mask" in f.name.lower() or "seg" in f.name.lower() or "MV" in f.name)]
-    
-    mask_lookup = {}
-    for f in mask_files:
-        stem = f.stem.replace("_mask", "").replace("mask_", "").replace("_seg", "")
-        mask_lookup[stem] = f
-    
-    for img_p in img_files:
-        if img_p.stem in mask_lookup:
-            patient_match = re.search(r"(LIDC-IDRI-\d+|patient_\d+|\d{4})", str(img_p), re.IGNORECASE)
-            patient_id = patient_match.group(1) if patient_match else img_p.parent.name
-            pairs.append((img_p, mask_lookup[img_p.stem], patient_id))
-    
-    return pairs
+
+                z_pos = None
+                edges = []
+                for child in roi.iter():
+                    child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                    if child_tag == "imageZposition" and child.text:
+                        try:
+                            z_pos = float(child.text)
+                        except ValueError:
+                            pass
+                    elif child_tag == "edgeMap":
+                        x, y = None, None
+                        for coord in child.iter():
+                            coord_tag = coord.tag.split("}")[-1] if "}" in coord.tag else coord.tag
+                            if coord_tag == "xCoord" and coord.text:
+                                try:
+                                    x = float(coord.text)
+                                except ValueError:
+                                    pass
+                            elif coord_tag == "yCoord" and coord.text:
+                                try:
+                                    y = float(coord.text)
+                                except ValueError:
+                                    pass
+                        if x is not None and y is not None:
+                            edges.append((x, y))
+
+                if z_pos is None or len(edges) < 3:
+                    continue
+
+                # Convert physical Z to slice index
+                slice_idx = int(round((z_pos - ct_origin_z) / ct_spacing_z))
+                if slice_idx < 0 or slice_idx >= num_slices:
+                    continue
+
+                contour = np.array(edges)
+                try:
+                    rr, cc = polygon(
+                        contour[:, 1], contour[:, 0],
+                        shape=volume_shape,
+                    )
+                    vote_volume[slice_idx, rr, cc] += 1
+                except Exception:
+                    continue
+
+    max_votes = vote_volume.max()
+    threshold = 2 if max_votes >= 2 else 1
+    mask_volume = (vote_volume >= threshold).astype(np.uint8)
+    return mask_volume
 
 
 def process_lidc_dataset(
     lidc_root: str,
     output_dir: str,
     target_size: Tuple[int, int] = (256, 256),
-    max_samples: int = 1000,
+    max_patients: int = 100,
+    context_slices: int = 1,
     test_ratio: float = 0.2,
     val_ratio: float = 0.2,
     labeled_ratio: float = 1.0,
     seed: int = 42,
 ) -> Dict:
-    """Extract and preprocess LIDC-IDRI slices with patient-level split."""
+    """Extract and preprocess LIDC-IDRI from raw DICOM + XML annotations.
+
+    Handles the washingtongold/lidcidri30 Kaggle dataset structure:
+        lidcidri30/
+          LIDC-IDRI-0001-0200/   (batch dirs with patient DICOM folders)
+          LIDC-IDRI-0201-0400/
+          LIDC-IDRI-0401-0600/
+          LIDC-XML-only/          (XML nodule annotations)
+
+    Pipeline per patient:
+      1. Load 3D CT volume from DICOM series (SimpleITK)
+      2. Match to XML annotations via SeriesInstanceUID
+      3. Parse XML contours -> 3D binary mask (majority vote)
+      4. Extract 2D slices with nodules (+context)
+      5. HU windowing + CLAHE + resize + LSF computation
+      6. Save as .npy files
+    """
+    import SimpleITK as sitk
+    import pydicom
+
+    lidc_path = Path(lidc_root)
     out_path = Path(output_dir)
     for split in ["train", "val", "test"]:
         os.makedirs(out_path / split / "images", exist_ok=True)
         os.makedirs(out_path / split / "masks", exist_ok=True)
         os.makedirs(out_path / split / "level_sets", exist_ok=True)
 
-    # Find image and mask pairs under lidc_root
-    paired = find_lidc_pairs(lidc_root)
+    # 1. Find batch directories and XML annotations
+    candidate_batches = list(lidc_path.rglob("LIDC-IDRI-0001-0200"))
+    if candidate_batches:
+        actual_root = candidate_batches[0].parent
+    else:
+        actual_root = lidc_path
 
-    if not paired:
-        print(f"No LIDC-IDRI image/mask pairs found in {lidc_root}.")
-        print(f"  Searched for: seg_LIDC-IDRI/<patient>/<nodule>/<slice>/slice.png + MV05.png")
-        print(f"  Also tried generic *_mask*/*_seg* patterns.")
+    batch_dirs = sorted([
+        d for d in actual_root.iterdir()
+        if d.is_dir() and d.name.startswith("LIDC-IDRI-") and d.name != "LIDC-XML-only"
+    ])
+
+    xml_dir = actual_root / "LIDC-XML-only"
+    if not xml_dir.exists():
+        xml_candidates = list(lidc_path.rglob("LIDC-XML-only"))
+        if xml_candidates:
+            xml_dir = xml_candidates[0]
+
+    print(f"LIDC-IDRI Dataset Discovery:")
+    print(f"  Search root: {lidc_path}")
+    print(f"  Resolved root: {actual_root}")
+    print(f"  Batch directories: {[d.name for d in batch_dirs]}")
+    print(f"  XML annotations: {xml_dir}")
+
+    if not batch_dirs:
+        print(f"  ERROR: No LIDC-IDRI batch directories found!")
         print(f"  Contents of {lidc_root}:")
-        try:
-            for item in sorted(Path(lidc_root).iterdir())[:10]:
-                print(f"    {'[DIR]' if item.is_dir() else '[FILE]'} {item.name}")
-        except Exception:
-            print(f"    (could not list directory)")
+        for item in sorted(lidc_path.iterdir())[:15]:
+            print(f"    {'[DIR]' if item.is_dir() else '[FILE]'} {item.name}")
         return {}
 
-    print(f"Found {len(paired)} LIDC-IDRI pairs.")
-    
-    # Subsample at patient level if too many pairs
-    unique_patients = sorted(list(set(p[2] for p in paired)))
-    print(f"  Across {len(unique_patients)} patients.")
-    
-    if len(paired) > max_samples:
-        # Subsample patients, not individual slices, to maintain patient-level integrity
+    # 2. Build XML UID index
+    uid_to_xml = _build_xml_uid_index(str(xml_dir)) if xml_dir.exists() else {}
+
+    # 3. Collect all patient directories
+    all_patients = []
+    for batch_dir in batch_dirs:
+        for patient_dir in sorted(batch_dir.iterdir()):
+            if patient_dir.is_dir() and patient_dir.name.startswith("LIDC-IDRI-"):
+                all_patients.append(patient_dir)
+
+    print(f"  Total patients found: {len(all_patients)}")
+
+    # Subsample patients if requested
+    if max_patients > 0 and len(all_patients) > max_patients:
         random.seed(seed)
-        pairs_by_patient = {}
-        for img_p, mask_p, pid in paired:
-            pairs_by_patient.setdefault(pid, []).append((img_p, mask_p, pid))
-        
-        shuffled_patients = list(pairs_by_patient.keys())
-        random.shuffle(shuffled_patients)
-        
-        paired = []
-        for pid in shuffled_patients:
-            paired.extend(pairs_by_patient[pid])
-            if len(paired) >= max_samples:
-                break
-        
-        unique_patients = sorted(list(set(p[2] for p in paired)))
-        print(f"  Subsampled to {len(paired)} pairs across {len(unique_patients)} patients.")
+        random.shuffle(all_patients)
+        all_patients = sorted(all_patients[:max_patients], key=lambda p: p.name)
+        print(f"  Subsampled to {len(all_patients)} patients.")
 
-    train_val_patients, test_patients = train_test_split(unique_patients, test_size=test_ratio, random_state=seed)
-    val_rel_ratio = val_ratio / (1.0 - test_ratio)
-    train_patients, val_patients = train_test_split(train_val_patients, test_size=val_rel_ratio, random_state=seed)
+    # 4. Patient-level split
+    patient_ids = [p.name for p in all_patients]
+    train_val_ids, test_ids = train_test_split(patient_ids, test_size=test_ratio, random_state=seed)
+    val_rel = val_ratio / (1.0 - test_ratio)
+    train_ids, val_ids = train_test_split(train_val_ids, test_size=val_rel, random_state=seed)
 
-    splits_map = {
-        "train": set(train_patients),
-        "val": set(val_patients),
-        "test": set(test_patients),
-    }
+    split_lookup = {}
+    for pid in train_ids:
+        split_lookup[pid] = "train"
+    for pid in val_ids:
+        split_lookup[pid] = "val"
+    for pid in test_ids:
+        split_lookup[pid] = "test"
 
-    print(f"  Split: Train={len(train_patients)} patients, Val={len(val_patients)} patients, Test={len(test_patients)} patients.")
+    print(f"  Split: Train={len(train_ids)}, Val={len(val_ids)}, Test={len(test_ids)}")
 
-    # Semi-supervised assignment on training set
-    shuffled_train_pts = list(train_patients)
-    random.shuffle(shuffled_train_pts)
-    num_labeled = int(round(len(shuffled_train_pts) * labeled_ratio))
-    labeled_patients_set = set(shuffled_train_pts[:num_labeled])
+    # Semi-supervised labeling
+    random.seed(seed)
+    shuffled_train = list(train_ids)
+    random.shuffle(shuffled_train)
+    num_labeled = int(round(len(shuffled_train) * labeled_ratio))
+    labeled_set = set(shuffled_train[:num_labeled])
 
     counts = {"train": 0, "val": 0, "test": 0}
     labeled_counts = {"train_labeled": 0, "train_unlabeled": 0}
+    skipped = {"no_ct": 0, "no_xml": 0, "no_nodules": 0, "error": 0}
 
-    for idx, (img_p, mask_p, patient_id) in enumerate(tqdm(paired, desc="Processing LIDC-IDRI")):
-        if patient_id in splits_map["test"]:
-            split_name = "test"
-            is_labeled = True
-        elif patient_id in splits_map["val"]:
-            split_name = "val"
-            is_labeled = True
-        else:
-            split_name = "train"
-            is_labeled = (patient_id in labeled_patients_set)
+    # 5. Process each patient
+    patient_to_dir = {p.name: p for p in all_patients}
 
-        if img_p.suffix == ".npy":
-            img_arr = np.load(img_p).astype(np.float32)
-        else:
-            img_arr = cv2.imread(str(img_p), cv2.IMREAD_GRAYSCALE)
-            if img_arr is None:
+    for patient_id in tqdm(patient_ids, desc="Processing LIDC-IDRI patients"):
+        patient_dir = patient_to_dir[patient_id]
+        split_name = split_lookup[patient_id]
+        is_labeled = (split_name != "train") or (patient_id in labeled_set)
+
+        try:
+            # 5a. Find and load CT volume
+            ct_folder = _find_ct_series_folder(patient_dir)
+            if ct_folder is None:
+                skipped["no_ct"] += 1
                 continue
-            img_arr = img_arr.astype(np.float32) / 255.0
 
-        if mask_p.suffix == ".npy":
-            mask_arr = np.load(mask_p).astype(np.float32)
-        else:
-            mask_arr = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE)
-            if mask_arr is None:
+            reader = sitk.ImageSeriesReader()
+            series_ids = reader.GetGDCMSeriesIDs(ct_folder)
+            if not series_ids:
+                skipped["no_ct"] += 1
                 continue
-            mask_arr = mask_arr.astype(np.float32) / 255.0
 
-        img_resized = resize_slice(img_arr, target_size=target_size, is_mask=False)
-        mask_bin = (mask_arr > 0.5).astype(np.uint8)
-        mask_resized = resize_slice(mask_bin, target_size=target_size, is_mask=True)
-        lsf_map = compute_level_set(mask_resized)
+            series_files = reader.GetGDCMSeriesFileNames(ct_folder, series_ids[0])
+            reader.SetFileNames(series_files)
+            ct_image = reader.Execute()
+            ct_array = sitk.GetArrayFromImage(ct_image)  # (Z, H, W) in HU
 
-        stem = f"lidc_{patient_id}_{idx}"
-        np.save(out_path / split_name / "images" / f"{stem}.npy", img_resized)
-        np.save(out_path / split_name / "masks" / f"{stem}.npy", mask_resized)
-        np.save(out_path / split_name / "level_sets" / f"{stem}.npy", lsf_map)
+            origin_z = ct_image.GetOrigin()[2]
+            spacing_z = ct_image.GetSpacing()[2]
+            num_slices = ct_array.shape[0]
+            h, w = ct_array.shape[1], ct_array.shape[2]
 
-        counts[split_name] += 1
-        if split_name == "train":
-            if is_labeled:
-                labeled_counts["train_labeled"] += 1
-            else:
-                labeled_counts["train_unlabeled"] += 1
+            # 5b. Get SeriesInstanceUID and find matching XML
+            dcm_sample = pydicom.dcmread(series_files[0], stop_before_pixels=True)
+            series_uid = str(dcm_sample.SeriesInstanceUID)
+
+            xml_path = uid_to_xml.get(series_uid)
+            if xml_path is None:
+                skipped["no_xml"] += 1
+                continue
+
+            # 5c. Extract nodule masks from XML
+            mask_volume = _extract_nodule_masks_from_xml(
+                xml_path, origin_z, spacing_z, num_slices, (h, w)
+            )
+
+            # 5d. Find slices with nodules and extract with context
+            lesion_slices = np.where(mask_volume.sum(axis=(1, 2)) > 0)[0]
+            if len(lesion_slices) == 0:
+                skipped["no_nodules"] += 1
+                continue
+
+            selected_indices = set()
+            for s in lesion_slices:
+                for offset in range(-context_slices, context_slices + 1):
+                    idx = s + offset
+                    if 0 <= idx < num_slices:
+                        selected_indices.add(int(idx))
+
+            # 5e. Preprocess and save each selected slice
+            for idx in sorted(selected_indices):
+                ct_slice = ct_array[idx].astype(np.float32)
+                mask_slice = mask_volume[idx]
+
+                # HU windowing + CLAHE
+                ct_norm = normalize_ct_slice(ct_slice)
+                ct_resized = resize_slice(ct_norm, target_size=target_size, is_mask=False)
+
+                mask_resized = resize_slice(mask_slice, target_size=target_size, is_mask=True)
+                lsf_map = compute_level_set(mask_resized)
+
+                stem = f"lidc_{patient_id}_s{idx}"
+                np.save(out_path / split_name / "images" / f"{stem}.npy", ct_resized)
+                np.save(out_path / split_name / "masks" / f"{stem}.npy", mask_resized)
+                np.save(out_path / split_name / "level_sets" / f"{stem}.npy", lsf_map)
+
+                counts[split_name] += 1
+                if split_name == "train":
+                    if is_labeled:
+                        labeled_counts["train_labeled"] += 1
+                    else:
+                        labeled_counts["train_unlabeled"] += 1
+
+        except Exception as e:
+            skipped["error"] += 1
+            continue
 
     manifest = {
         "dataset": "LIDC-IDRI",
+        "target_size": list(target_size),
+        "total_extracted_slices": sum(counts.values()),
         "splits": counts,
         "semi_supervised_breakdown": labeled_counts,
+        "skipped": skipped,
+        "labeled_ratio": labeled_ratio,
+        "seed": seed,
     }
+
+    # Save LIDC manifest
+    with open(out_path / "lidc_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
     print(f"\nLIDC-IDRI preprocessing complete!")
     print(json.dumps(manifest, indent=2))
+    if sum(skipped.values()) > 0:
+        print(f"Skipped patients: {skipped}")
     return manifest
 
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess CT datasets for DTCR-U-Net")
     parser.add_argument("--mosmed", default=None, help="Path to MosMed dataset directory")
-    parser.add_argument("--lidc", default=None, help="Path to LIDC-IDRI dataset directory (optional)")
+    parser.add_argument("--lidc", default=None, help="Path to LIDC-IDRI dataset directory (raw DICOM + XML)")
     parser.add_argument("--out", default="data/processed", help="Output directory for processed .npy files")
     parser.add_argument("--size", type=int, default=256, help="Target image size (e.g. 256 for 256x256)")
     parser.add_argument("--context", type=int, default=1, help="Number of adjacent context slices (+/-)")
     parser.add_argument("--labeled-ratio", type=float, default=1.0, help="Fraction of labeled samples (0.4 for semi-supervised)")
+    parser.add_argument("--max-patients", type=int, default=100, help="Max LIDC patients to process (default: 100)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -557,6 +684,8 @@ def main():
             lidc_root=args.lidc,
             output_dir=args.out,
             target_size=(args.size, args.size),
+            max_patients=args.max_patients,
+            context_slices=args.context,
             labeled_ratio=args.labeled_ratio,
             seed=args.seed,
         )
