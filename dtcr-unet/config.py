@@ -19,7 +19,7 @@ class DTCRConfig:
     # Training parameters
     epochs: int = 80
     batch_size: int = 16          # 16 or 32 depending on GPU VRAM
-    lr: float = 1e-3              # Initial learning rate
+    lr: float = 5e-4              # Initial learning rate
     weight_decay: float = 1e-4    # AdamW weight decay
     min_lr: float = 1e-6          # Cosine Annealing minimum learning rate
 

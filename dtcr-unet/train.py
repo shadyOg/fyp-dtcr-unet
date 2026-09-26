@@ -68,19 +68,26 @@ def train_one_epoch(
             )
             scaled_loss = loss / grad_accum_steps
 
+        # Check if loss is finite before backward
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         if use_amp and device.type == "cuda":
             scaler.scale(scaled_loss).backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             scaled_loss.backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
         running_losses["total"] += loss_dict["loss_total"]
@@ -254,7 +261,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=80, help="Total training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
     parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate")
     parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")
