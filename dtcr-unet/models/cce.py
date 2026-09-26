@@ -97,7 +97,7 @@ class ChannelContextualEnhancement(nn.Module):
         # Similarity: (B, C_sigma, d) @ (B, d, C_sigma) -> (B, C_sigma, C_sigma)
         scale = (self.full_dim) ** 0.5
         sim = torch.bmm(q_c, k_c.transpose(1, 2)) / scale
-        m_c = F.softmax(sim, dim=-1)  # (B, C_sigma, C_sigma)
+        m_c = F.softmax(sim.float(), dim=-1).to(v_c.dtype)  # (B, C_sigma, C_sigma)
 
         # 4. Weight value matrix and residual connection: (B, C_sigma, d)
         attended = torch.bmm(m_c, v_c) + t_sigma

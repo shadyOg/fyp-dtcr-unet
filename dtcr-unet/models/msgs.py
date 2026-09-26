@@ -73,7 +73,7 @@ class MultiScaleGlobalSpatial(nn.Module):
         # (B, N, C) @ (B, C, N) -> (B, N, N)
         scale = (self.out_channels) ** 0.5
         sim_s = torch.bmm(q_s.transpose(1, 2), k_s) / scale
-        m_s = F.softmax(sim_s, dim=-1)  # (B, N, N)
+        m_s = F.softmax(sim_s.float(), dim=-1).to(v_s.dtype)  # (B, N, N)
 
         # 3. Spatial attention weighting and residual connection (Eq. 20)
         # (B, C, N) @ (B, N, N) -> (B, C, N)

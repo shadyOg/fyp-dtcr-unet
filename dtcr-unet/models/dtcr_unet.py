@@ -27,8 +27,8 @@ from .mssc import MultiScaleSkipConnection
 
 def compute_gradient_norm(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute spatial gradient norms ||nabla z|| and ||nabla z||^2 using Sobel filters."""
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=z.device).view(1, 1, 3, 3) / 8.0
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=z.device).view(1, 1, 3, 3) / 8.0
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=z.dtype, device=z.device).view(1, 1, 3, 3) / 8.0
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=z.dtype, device=z.device).view(1, 1, 3, 3) / 8.0
 
     pad_z = F.pad(z, (1, 1, 1, 1), mode="replicate")
     grad_x = F.conv2d(pad_z, sobel_x)

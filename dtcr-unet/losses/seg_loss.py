@@ -10,9 +10,9 @@ import torch.nn.functional as F
 
 
 class DiceLoss(nn.Module):
-    """Soft Dice Loss for binary segmentation."""
+    """Soft Dice Loss for binary segmentation matching Eq. 8 of paper."""
 
-    def __init__(self, smooth: float = 1e-5):
+    def __init__(self, smooth: float = 1.0):
         super().__init__()
         self.smooth = smooth
 
@@ -34,9 +34,9 @@ class DiceLoss(nn.Module):
 
 
 class SupervisedSegLoss(nn.Module):
-    """Hybrid BCE + Dice Loss for Task 1 (Pixel-level Segmentation)."""
+    """Segmentation Loss with dominant Dice component to prevent background collapse."""
 
-    def __init__(self, bce_weight: float = 0.5, dice_weight: float = 0.5, smooth: float = 1e-5):
+    def __init__(self, bce_weight: float = 0.2, dice_weight: float = 1.0, smooth: float = 1.0):
         super().__init__()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight

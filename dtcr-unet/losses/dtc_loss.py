@@ -10,7 +10,16 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .lsf_loss import compute_spatial_gradients
+def compute_spatial_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute spatial gradients (grad_x, grad_y) using Sobel filters matching tensor dtype."""
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3) / 8.0
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3) / 8.0
+
+    pad_x = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    grad_x = F.conv2d(pad_x, sobel_x)
+    grad_y = F.conv2d(pad_x, sobel_y)
+
+    return grad_x, grad_y
 
 
 def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int) -> float:
@@ -63,9 +72,10 @@ class DualTaskConsistencyLoss(nn.Module):
         l_grad = F.mse_loss(f1_gx, t_gx) + F.mse_loss(f1_gy, t_gy)
 
         # 3. Interaction Enhancement Loss L_interact: ||f1(x) * f2(x)|| (Eq. 7)
-        # Note: Measures mutual response between segmentation probabilities and LSF
-        interaction = f1_prob * torch.abs(f2_lsf)
-        l_interact = interaction.mean()
+        # Symmetrically penalizes false positives in background (f2 > 0) and false negatives in lesion (f2 < 0)
+        interaction_fp = f1_prob * torch.clamp(f2_lsf, min=0.0)
+        interaction_fn = (1.0 - f1_prob) * torch.clamp(-f2_lsf, min=0.0)
+        l_interact = (interaction_fp + interaction_fn).mean()
 
         # Total L_DTC (Eq. 4)
         l_dtc = l_main + self.lambda1 * l_grad + self.lambda2 * l_interact

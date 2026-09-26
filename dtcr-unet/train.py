@@ -68,30 +68,18 @@ def train_one_epoch(
             )
             scaled_loss = loss / grad_accum_steps
 
-        # Skip backward if loss itself is non-finite
-        if torch.isnan(loss) or torch.isinf(loss):
-            optimizer.zero_grad(set_to_none=True)
-            continue
-
         if use_amp and device.type == "cuda":
             scaler.scale(scaled_loss).backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
-                    continue
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             scaled_loss.backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 

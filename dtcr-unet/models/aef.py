@@ -49,13 +49,13 @@ class AttentionEmbeddingFusion(nn.Module):
 
         # 2. Channel-level attention weights Ac via GAP + Softmax (Eq. 24)
         gap_cce = f_cce_prime.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
-        a_c = F.softmax(gap_cce, dim=1)  # Channel-wise softmax
+        a_c = F.softmax(gap_cce.float(), dim=1).to(gap_cce.dtype)  # Channel-wise softmax
 
         # 3. Spatial-level attention weights As via 1x1 Conv + Softmax (Eq. 25)
         spatial_logits = self.spatial_conv(f_msgs_prime)  # (B, 1, H, W)
         b, _, h, w = spatial_logits.shape
         # Spatial softmax across HxW
-        a_s = F.softmax(spatial_logits.view(b, 1, -1), dim=-1).view(b, 1, h, w)
+        a_s = F.softmax(spatial_logits.view(b, 1, -1).float(), dim=-1).view(b, 1, h, w).to(spatial_logits.dtype)
 
         # 4. Element-wise weighted fusion (Eq. 26)
         f_aef = a_c * f_cce_prime + a_s * f_msgs_prime

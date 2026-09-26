@@ -13,8 +13,8 @@ from typing import Tuple
 
 def compute_spatial_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute spatial gradients (grad_x, grad_y) using Sobel filters."""
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3) / 8.0
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3) / 8.0
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3) / 8.0
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3) / 8.0
 
     pad_x = F.pad(x, (1, 1, 1, 1), mode="replicate")
     grad_x = F.conv2d(pad_x, sobel_x)
