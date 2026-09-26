@@ -69,14 +69,13 @@ class MultiScaleGlobalSpatial(nn.Module):
         k_s = self.k_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
         v_s = self.v_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
 
-        # 2. Scaled Dot-Product Spatial Similarity matrix M_s (Eq. 19)
-        # (B, N, C) @ (B, C, N) -> (B, N, N)
-        scale = (self.out_channels) ** 0.5
-        sim_s = torch.bmm(q_s.transpose(1, 2), k_s) / scale
-        m_s = F.softmax(sim_s.float(), dim=-1).to(v_s.dtype)  # (B, N, N)
+        # 2. Scaled Dot-Product Spatial Similarity matrix M_s (Eq. 19) in FP32 for numerical stability
+        scale = float(self.out_channels) ** 0.5
+        sim_s = torch.bmm(q_s.transpose(1, 2).float(), k_s.float()) / scale
+        sim_s_max = torch.max(sim_s, dim=-1, keepdim=True)[0]
+        m_s = F.softmax(sim_s - sim_s_max, dim=-1).to(v_s.dtype)  # (B, N, N)
 
         # 3. Spatial attention weighting and residual connection (Eq. 20)
-        # (B, C, N) @ (B, N, N) -> (B, C, N)
         attended_s = torch.bmm(v_s, m_s.transpose(1, 2)).view(b, self.out_channels, h, w)
         residual = self.res_proj(f_cce)
         f_msgs = attended_s + residual  # (B, C, H, W)

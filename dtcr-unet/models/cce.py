@@ -93,11 +93,11 @@ class ChannelContextualEnhancement(nn.Module):
         k_c = self.k_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
         v_c = self.v_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
 
-        # 3. Channel dot-product attention matrix M_c (Eq. 15)
-        # Similarity: (B, C_sigma, d) @ (B, d, C_sigma) -> (B, C_sigma, C_sigma)
-        scale = (self.full_dim) ** 0.5
-        sim = torch.bmm(q_c, k_c.transpose(1, 2)) / scale
-        m_c = F.softmax(sim.float(), dim=-1).to(v_c.dtype)  # (B, C_sigma, C_sigma)
+        # 3. Channel dot-product attention matrix M_c (Eq. 15) in FP32 for numerical stability
+        scale = float(self.full_dim) ** 0.5
+        sim = torch.bmm(q_c.float(), k_c.transpose(1, 2).float()) / scale
+        sim_max = torch.max(sim, dim=-1, keepdim=True)[0]
+        m_c = F.softmax(sim - sim_max, dim=-1).to(v_c.dtype)
 
         # 4. Weight value matrix and residual connection: (B, C_sigma, d)
         attended = torch.bmm(m_c, v_c) + t_sigma
