@@ -115,35 +115,38 @@ def resize_slice(
 
 
 def find_mosmed_files(root_dir: str) -> Tuple[List[str], List[str]]:
-    """Recursively discover CT volumes and paired mask files in MosMed directory.
-
-    Supports:
-    - studies/CT-* and masks/ layout
-    - flat / nested folder structures with _mask suffix
-    """
+    """Recursively discover CT volumes and paired mask files in any directory layout."""
+    import re
     root_path = Path(root_dir)
-    
-    # 1. Find all mask files
-    mask_files = list(root_path.glob("**/masks/*_mask.nii*")) or list(root_path.glob("**/*_mask.nii*"))
-    mask_files = sorted(set(str(f) for f in mask_files))
+
+    all_nii_files = []
+    for dirpath, _, filenames in os.walk(root_path):
+        for f in filenames:
+            if f.endswith((".nii", ".nii.gz")):
+                all_nii_files.append(os.path.join(dirpath, f))
+
+    mask_files = [f for f in all_nii_files if "_mask" in os.path.basename(f).lower()]
+    ct_files = [f for f in all_nii_files if "_mask" not in os.path.basename(f).lower()]
 
     paired_studies = []
     paired_masks = []
 
-    for mask_path in mask_files:
-        stem = Path(mask_path).stem
-        if stem.endswith(".nii"):
-            stem = Path(stem).stem
-        study_id = stem.replace("_mask", "")
+    # Map study ID -> ct file path
+    ct_map = {}
+    for c in ct_files:
+        basename = os.path.basename(c)
+        match = re.search(r"(study_\d+)", basename, re.IGNORECASE)
+        if match:
+            ct_map[match.group(1).lower()] = c
 
-        # Search for corresponding CT scan across studies/ subfolders
-        candidates = list(root_path.glob(f"**/{study_id}.nii*"))
-        # Filter out the mask file itself from candidates
-        ct_candidates = [c for c in candidates if "_mask" not in str(c)]
-
-        if ct_candidates:
-            paired_studies.append(str(ct_candidates[0]))
-            paired_masks.append(mask_path)
+    for m in mask_files:
+        basename = os.path.basename(m)
+        match = re.search(r"(study_\d+)", basename, re.IGNORECASE)
+        if match:
+            study_key = match.group(1).lower()
+            if study_key in ct_map:
+                paired_studies.append(ct_map[study_key])
+                paired_masks.append(m)
 
     return paired_studies, paired_masks
 
