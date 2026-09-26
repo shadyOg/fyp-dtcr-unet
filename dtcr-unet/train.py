@@ -77,17 +77,15 @@ def train_one_epoch(
             scaler.scale(scaled_loss).backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isfinite(grad_norm):
-                    scaler.step(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             scaled_loss.backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isfinite(grad_norm):
-                    optimizer.step()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
         running_losses["total"] += loss_dict["loss_total"]
