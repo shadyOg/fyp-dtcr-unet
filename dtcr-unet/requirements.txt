@@ -1,11 +1,13 @@
-# dependencies
-
 torch
 torchvision
 numpy
+scipy
 nibabel        # for reading .nii CT files
+pydicom        # for reading .dcm DICOM files
 SimpleITK      # for medical image processing
-scikit-image   # for preprocessing
+scikit-image   # for image transforms & filtering
+scikit-learn   # for dataset splitting
+opencv-python-headless # for fast resize & CLAHE
 matplotlib     # for visualizing results
 tqdm           # progress bars
 kaggle         # Kaggle CLI for dataset download
