@@ -40,7 +40,7 @@ def evaluate_checkpoint(
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
-    _, _, test_loader = get_dataloaders(data_dir=data_dir, batch_size=batch_size, transform=False)
+    _, _, test_loader = get_dataloaders(data_dir=data_dir, batch_size=batch_size)
     print(f"Test samples: {len(test_loader.dataset)}")
 
     metrics_list = []
