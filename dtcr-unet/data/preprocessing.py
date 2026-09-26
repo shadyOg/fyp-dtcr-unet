@@ -55,8 +55,10 @@ def compute_level_set(mask_2d: np.ndarray, lambda_smooth: float = 0.3) -> np.nda
     dist_out = distance_transform_edt(~mask_bool)
     dist_in = distance_transform_edt(mask_bool)
 
-    # Level set: negative inside, positive outside
-    lsf = (dist_out - dist_in).astype(np.float32)
+    # Level set: negative inside, positive outside, normalized to [-1, 1]
+    h, w = mask_2d.shape
+    scale = float(max(h, w))
+    lsf = ((dist_out - dist_in) / scale).astype(np.float32)
 
     # Optional gradient smoothing adjustment if lambda_smooth > 0
     if lambda_smooth > 0:

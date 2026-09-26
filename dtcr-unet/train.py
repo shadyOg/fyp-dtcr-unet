@@ -71,12 +71,15 @@ def train_one_epoch(
         if use_amp and device.type == "cuda":
             scaler.scale(loss).backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 

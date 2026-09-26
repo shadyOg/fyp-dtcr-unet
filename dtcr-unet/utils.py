@@ -26,6 +26,7 @@ def compute_binary_metrics(
     Returns:
         Dictionary with Dice, Sensitivity, Specificity, Accuracy, F1, and Hausdorff Distance.
     """
+    pred_mask = np.nan_to_num(pred_mask, nan=0.0, posinf=1.0, neginf=0.0)
     p = (pred_mask > threshold).astype(bool)
     t = (true_mask > 0.5).astype(bool)
 

@@ -35,7 +35,7 @@ def compute_gradient_norm(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     grad_y = F.conv2d(pad_z, sobel_y)
 
     grad_norm_sq = grad_x**2 + grad_y**2
-    grad_norm = torch.sqrt(grad_norm_sq + 1e-8)
+    grad_norm = torch.sqrt(torch.clamp(grad_norm_sq, min=1e-7))
 
     return grad_norm, grad_norm_sq
 
