@@ -302,9 +302,119 @@ def process_mosmed_dataset(
     return manifest
 
 
+def process_lidc_dataset(
+    lidc_root: str,
+    output_dir: str,
+    target_size: Tuple[int, int] = (256, 256),
+    max_samples: int = 1000,
+    test_ratio: float = 0.2,
+    val_ratio: float = 0.2,
+    labeled_ratio: float = 1.0,
+    seed: int = 42,
+) -> Dict:
+    """Extract and preprocess LIDC-IDRI slices with patient-level split."""
+    import re
+    out_path = Path(output_dir)
+    for split in ["train", "val", "test"]:
+        os.makedirs(out_path / split / "images", exist_ok=True)
+        os.makedirs(out_path / split / "masks", exist_ok=True)
+        os.makedirs(out_path / split / "level_sets", exist_ok=True)
+
+    # Find image and mask pairs under lidc_root
+    lidc_path = Path(lidc_root)
+    all_files = list(lidc_path.rglob("*.*"))
+    img_files = [f for f in all_files if f.suffix.lower() in [".png", ".jpg", ".bmp", ".npy"] and "mask" not in f.name.lower() and "seg" not in f.name.lower()]
+    mask_files = [f for f in all_files if f.suffix.lower() in [".png", ".jpg", ".bmp", ".npy"] and ("mask" in f.name.lower() or "seg" in f.name.lower())]
+
+    mask_lookup = {f.stem.replace("_mask", "").replace("mask_", "").replace("_seg", ""): f for f in mask_files}
+    paired = []
+    for img_p in img_files:
+        stem = img_p.stem
+        if stem in mask_lookup:
+            patient_match = re.search(r"(LIDC-IDRI-\d+|patient_\d+|\d{4})", str(img_p), re.IGNORECASE)
+            patient_id = patient_match.group(1) if patient_match else img_p.parent.name
+            paired.append((img_p, mask_lookup[stem], patient_id))
+
+    if not paired:
+        print(f"No LIDC-IDRI image/mask pairs found in {lidc_root}.")
+        return {}
+
+    print(f"Found {len(paired)} LIDC-IDRI pairs.")
+    # Subsample if requested
+    if len(paired) > max_samples:
+        random.seed(seed)
+        random.shuffle(paired)
+        paired = paired[:max_samples]
+
+    unique_patients = sorted(list(set(p[2] for p in paired)))
+    train_val_patients, test_patients = train_test_split(unique_patients, test_size=test_ratio, random_state=seed)
+    val_rel_ratio = val_ratio / (1.0 - test_ratio)
+    train_patients, val_patients = train_test_split(train_val_patients, test_size=val_rel_ratio, random_state=seed)
+
+    splits_map = {
+        "train": set(train_patients),
+        "val": set(val_patients),
+        "test": set(test_patients),
+    }
+
+    # Semi-supervised assignment on training set
+    shuffled_train_pts = list(train_patients)
+    random.shuffle(shuffled_train_pts)
+    num_labeled = int(round(len(shuffled_train_pts) * labeled_ratio))
+    labeled_patients_set = set(shuffled_train_pts[:num_labeled])
+
+    counts = {"train": 0, "val": 0, "test": 0}
+    labeled_counts = {"train_labeled": 0, "train_unlabeled": 0}
+
+    for idx, (img_p, mask_p, patient_id) in enumerate(tqdm(paired, desc="Processing LIDC-IDRI")):
+        if patient_id in splits_map["test"]:
+            split_name = "test"
+            is_labeled = True
+        elif patient_id in splits_map["val"]:
+            split_name = "val"
+            is_labeled = True
+        else:
+            split_name = "train"
+            is_labeled = (patient_id in labeled_patients_set)
+
+        if img_p.suffix == ".npy":
+            img_arr = np.load(img_p).astype(np.float32)
+        else:
+            img_arr = cv2.imread(str(img_p), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+
+        if mask_p.suffix == ".npy":
+            mask_arr = np.load(mask_p).astype(np.float32)
+        else:
+            mask_arr = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+
+        img_resized = resize_slice(img_arr, target_size=target_size, is_mask=False)
+        mask_bin = (mask_arr > 0.5).astype(np.uint8)
+        mask_resized = resize_slice(mask_bin, target_size=target_size, is_mask=True)
+        lsf_map = compute_level_set(mask_resized)
+
+        stem = f"lidc_{patient_id}_{idx}"
+        np.save(out_path / split_name / "images" / f"{stem}.npy", img_resized)
+        np.save(out_path / split_name / "masks" / f"{stem}.npy", mask_resized)
+        np.save(out_path / split_name / "level_sets" / f"{stem}.npy", lsf_map)
+
+        counts[split_name] += 1
+        if split_name == "train":
+            if is_labeled:
+                labeled_counts["train_labeled"] += 1
+            else:
+                labeled_counts["train_unlabeled"] += 1
+
+    return {
+        "dataset": "LIDC-IDRI",
+        "splits": counts,
+        "semi_supervised_breakdown": labeled_counts,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preprocess CT datasets for DTCR-U-Net")
-    parser.add_argument("--mosmed", required=True, help="Path to MosMed dataset directory")
+    parser.add_argument("--mosmed", default=None, help="Path to MosMed dataset directory")
+    parser.add_argument("--lidc", default=None, help="Path to LIDC-IDRI dataset directory (optional)")
     parser.add_argument("--out", default="data/processed", help="Output directory for processed .npy files")
     parser.add_argument("--size", type=int, default=256, help="Target image size (e.g. 256 for 256x256)")
     parser.add_argument("--context", type=int, default=1, help="Number of adjacent context slices (+/-)")
@@ -312,14 +422,27 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    process_mosmed_dataset(
-        mosmed_root=args.mosmed,
-        output_dir=args.out,
-        target_size=(args.size, args.size),
-        context_slices=args.context,
-        labeled_ratio=args.labeled_ratio,
-        seed=args.seed,
-    )
+    if args.mosmed is None and args.lidc is None:
+        parser.error("At least one of --mosmed or --lidc must be provided.")
+
+    if args.mosmed:
+        process_mosmed_dataset(
+            mosmed_root=args.mosmed,
+            output_dir=args.out,
+            target_size=(args.size, args.size),
+            context_slices=args.context,
+            labeled_ratio=args.labeled_ratio,
+            seed=args.seed,
+        )
+
+    if args.lidc:
+        process_lidc_dataset(
+            lidc_root=args.lidc,
+            output_dir=args.out,
+            target_size=(args.size, args.size),
+            labeled_ratio=args.labeled_ratio,
+            seed=args.seed,
+        )
 
 
 if __name__ == "__main__":
