@@ -51,7 +51,7 @@ def train_one_epoch(
         level_sets = batch["level_set"].to(device, non_blocking=True)
         is_labeled = batch["is_labeled"].to(device, non_blocking=True)
 
-        with autocast(enabled=use_amp and device.type == "cuda"):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
             # Forward pass
             f1_logits, f2_lsf, f2_trans = model(images)
 
@@ -167,7 +167,7 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
         eta_min=cfg.min_lr,
     )
 
-    scaler = GradScaler(enabled=use_amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
 
     best_val_dice = 0.0
     history = []

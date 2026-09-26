@@ -99,6 +99,8 @@ class MultiScaleSkipConnection(nn.Module):
 
         f_low = features[0]
         f_high = features[-1]
+        if (f_high.shape[2], f_high.shape[3]) != target_size:
+            f_high = F.interpolate(f_high, size=target_size, mode="bilinear", align_corners=True)
 
         # 2. Dense connection (Eq. 29)
         f_concat = torch.cat(aligned_features, dim=1)  # Concat([F_low, F_mid, F_high])
