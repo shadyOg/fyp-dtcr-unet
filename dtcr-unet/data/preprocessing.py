@@ -302,6 +302,100 @@ def process_mosmed_dataset(
     return manifest
 
 
+def find_lidc_pairs(lidc_root: str) -> List[Tuple[Path, Path, str]]:
+    """Discover LIDC-IDRI image/mask pairs from the washingtongold/lidcidri30 dataset.
+
+    Expected structure (Kaggle: washingtongold/lidcidri30):
+        seg_LIDC-IDRI/
+          LIDC-IDRI-0001/
+            nodule_01/
+              slice_001/
+                slice.png      <- CT image
+                MV05.png       <- majority vote mask (>=50% annotators)
+    
+    Also supports the shuyueg/lidc-idri-byslices variant with same structure.
+    Falls back to generic *_mask*/*_seg* pattern matching if LIDC structure not found.
+    """
+    import re
+    root = Path(lidc_root)
+    
+    # Strategy 1: Look for the specific seg_LIDC-IDRI directory structure
+    seg_dirs = list(root.rglob("seg_LIDC-IDRI"))
+    if not seg_dirs:
+        # Also try without the seg_ prefix
+        seg_dirs = list(root.rglob("LIDC-IDRI"))
+    
+    pairs = []
+    
+    if seg_dirs:
+        seg_dir = seg_dirs[0]
+        print(f"Found LIDC-IDRI structure at: {seg_dir}")
+        
+        for patient_dir in sorted(seg_dir.iterdir()):
+            if not patient_dir.is_dir():
+                continue
+            patient_id = patient_dir.name  # e.g., "LIDC-IDRI-0001"
+            
+            for nodule_dir in sorted(patient_dir.iterdir()):
+                if not nodule_dir.is_dir():
+                    continue
+                    
+                for slice_dir in sorted(nodule_dir.iterdir()):
+                    if not slice_dir.is_dir():
+                        continue
+                    
+                    # Look for image file (slice.png or similar)
+                    img_path = slice_dir / "slice.png"
+                    if not img_path.exists():
+                        # Try other common names
+                        for candidate in ["image.png", "img.png", "slice.jpg"]:
+                            img_path = slice_dir / candidate
+                            if img_path.exists():
+                                break
+                    
+                    # Look for mask file (MV05.png = majority vote >= 50%)
+                    mask_path = slice_dir / "MV05.png"
+                    if not mask_path.exists():
+                        # Try other mask names
+                        for candidate in ["mask.png", "seg.png", "MV50.png", "annotation.png"]:
+                            mask_path = slice_dir / candidate
+                            if mask_path.exists():
+                                break
+                    
+                    if img_path.exists() and mask_path.exists():
+                        pairs.append((img_path, mask_path, patient_id))
+        
+        if pairs:
+            return pairs
+    
+    # Strategy 2: Fallback - generic filename pattern matching
+    print("LIDC-IDRI seg directory not found, trying generic pattern matching...")
+    all_files = list(root.rglob("*.*"))
+    img_exts = {".png", ".jpg", ".bmp", ".npy", ".tif", ".tiff"}
+    
+    img_files = [f for f in all_files 
+                 if f.suffix.lower() in img_exts 
+                 and "mask" not in f.name.lower() 
+                 and "seg" not in f.name.lower()
+                 and "MV" not in f.name]
+    mask_files = [f for f in all_files 
+                  if f.suffix.lower() in img_exts 
+                  and ("mask" in f.name.lower() or "seg" in f.name.lower() or "MV" in f.name)]
+    
+    mask_lookup = {}
+    for f in mask_files:
+        stem = f.stem.replace("_mask", "").replace("mask_", "").replace("_seg", "")
+        mask_lookup[stem] = f
+    
+    for img_p in img_files:
+        if img_p.stem in mask_lookup:
+            patient_match = re.search(r"(LIDC-IDRI-\d+|patient_\d+|\d{4})", str(img_p), re.IGNORECASE)
+            patient_id = patient_match.group(1) if patient_match else img_p.parent.name
+            pairs.append((img_p, mask_lookup[img_p.stem], patient_id))
+    
+    return pairs
+
+
 def process_lidc_dataset(
     lidc_root: str,
     output_dir: str,
@@ -313,7 +407,6 @@ def process_lidc_dataset(
     seed: int = 42,
 ) -> Dict:
     """Extract and preprocess LIDC-IDRI slices with patient-level split."""
-    import re
     out_path = Path(output_dir)
     for split in ["train", "val", "test"]:
         os.makedirs(out_path / split / "images", exist_ok=True)
@@ -321,32 +414,45 @@ def process_lidc_dataset(
         os.makedirs(out_path / split / "level_sets", exist_ok=True)
 
     # Find image and mask pairs under lidc_root
-    lidc_path = Path(lidc_root)
-    all_files = list(lidc_path.rglob("*.*"))
-    img_files = [f for f in all_files if f.suffix.lower() in [".png", ".jpg", ".bmp", ".npy"] and "mask" not in f.name.lower() and "seg" not in f.name.lower()]
-    mask_files = [f for f in all_files if f.suffix.lower() in [".png", ".jpg", ".bmp", ".npy"] and ("mask" in f.name.lower() or "seg" in f.name.lower())]
-
-    mask_lookup = {f.stem.replace("_mask", "").replace("mask_", "").replace("_seg", ""): f for f in mask_files}
-    paired = []
-    for img_p in img_files:
-        stem = img_p.stem
-        if stem in mask_lookup:
-            patient_match = re.search(r"(LIDC-IDRI-\d+|patient_\d+|\d{4})", str(img_p), re.IGNORECASE)
-            patient_id = patient_match.group(1) if patient_match else img_p.parent.name
-            paired.append((img_p, mask_lookup[stem], patient_id))
+    paired = find_lidc_pairs(lidc_root)
 
     if not paired:
         print(f"No LIDC-IDRI image/mask pairs found in {lidc_root}.")
+        print(f"  Searched for: seg_LIDC-IDRI/<patient>/<nodule>/<slice>/slice.png + MV05.png")
+        print(f"  Also tried generic *_mask*/*_seg* patterns.")
+        print(f"  Contents of {lidc_root}:")
+        try:
+            for item in sorted(Path(lidc_root).iterdir())[:10]:
+                print(f"    {'[DIR]' if item.is_dir() else '[FILE]'} {item.name}")
+        except Exception:
+            print(f"    (could not list directory)")
         return {}
 
     print(f"Found {len(paired)} LIDC-IDRI pairs.")
-    # Subsample if requested
-    if len(paired) > max_samples:
-        random.seed(seed)
-        random.shuffle(paired)
-        paired = paired[:max_samples]
-
+    
+    # Subsample at patient level if too many pairs
     unique_patients = sorted(list(set(p[2] for p in paired)))
+    print(f"  Across {len(unique_patients)} patients.")
+    
+    if len(paired) > max_samples:
+        # Subsample patients, not individual slices, to maintain patient-level integrity
+        random.seed(seed)
+        pairs_by_patient = {}
+        for img_p, mask_p, pid in paired:
+            pairs_by_patient.setdefault(pid, []).append((img_p, mask_p, pid))
+        
+        shuffled_patients = list(pairs_by_patient.keys())
+        random.shuffle(shuffled_patients)
+        
+        paired = []
+        for pid in shuffled_patients:
+            paired.extend(pairs_by_patient[pid])
+            if len(paired) >= max_samples:
+                break
+        
+        unique_patients = sorted(list(set(p[2] for p in paired)))
+        print(f"  Subsampled to {len(paired)} pairs across {len(unique_patients)} patients.")
+
     train_val_patients, test_patients = train_test_split(unique_patients, test_size=test_ratio, random_state=seed)
     val_rel_ratio = val_ratio / (1.0 - test_ratio)
     train_patients, val_patients = train_test_split(train_val_patients, test_size=val_rel_ratio, random_state=seed)
@@ -356,6 +462,8 @@ def process_lidc_dataset(
         "val": set(val_patients),
         "test": set(test_patients),
     }
+
+    print(f"  Split: Train={len(train_patients)} patients, Val={len(val_patients)} patients, Test={len(test_patients)} patients.")
 
     # Semi-supervised assignment on training set
     shuffled_train_pts = list(train_patients)
@@ -380,12 +488,18 @@ def process_lidc_dataset(
         if img_p.suffix == ".npy":
             img_arr = np.load(img_p).astype(np.float32)
         else:
-            img_arr = cv2.imread(str(img_p), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+            img_arr = cv2.imread(str(img_p), cv2.IMREAD_GRAYSCALE)
+            if img_arr is None:
+                continue
+            img_arr = img_arr.astype(np.float32) / 255.0
 
         if mask_p.suffix == ".npy":
             mask_arr = np.load(mask_p).astype(np.float32)
         else:
-            mask_arr = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+            mask_arr = cv2.imread(str(mask_p), cv2.IMREAD_GRAYSCALE)
+            if mask_arr is None:
+                continue
+            mask_arr = mask_arr.astype(np.float32) / 255.0
 
         img_resized = resize_slice(img_arr, target_size=target_size, is_mask=False)
         mask_bin = (mask_arr > 0.5).astype(np.uint8)
@@ -404,11 +518,14 @@ def process_lidc_dataset(
             else:
                 labeled_counts["train_unlabeled"] += 1
 
-    return {
+    manifest = {
         "dataset": "LIDC-IDRI",
         "splits": counts,
         "semi_supervised_breakdown": labeled_counts,
     }
+    print(f"\nLIDC-IDRI preprocessing complete!")
+    print(json.dumps(manifest, indent=2))
+    return manifest
 
 
 def main():
