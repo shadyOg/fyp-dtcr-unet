@@ -66,20 +66,32 @@ def train_one_epoch(
                 epoch=epoch,
                 max_epochs=max_epochs,
             )
-            loss = loss / grad_accum_steps
+            scaled_loss = loss / grad_accum_steps
+
+        # Skip backward if loss itself is non-finite
+        if torch.isnan(loss) or torch.isinf(loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         if use_amp and device.type == "cuda":
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.update()
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
-            loss.backward()
+            scaled_loss.backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -114,7 +126,7 @@ def evaluate_dataset(
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].cpu().numpy()
 
-            with autocast(enabled=use_amp and device.type == "cuda"):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
                 f1_logits, _, _ = model(images)
                 probs = torch.sigmoid(f1_logits).float().cpu().numpy()
 

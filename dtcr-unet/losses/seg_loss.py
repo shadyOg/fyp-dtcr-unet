@@ -22,7 +22,8 @@ class DiceLoss(nn.Module):
             pred: Predicted probabilities or sigmoid outputs of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        pred_flat = pred.contiguous().view(pred.size(0), -1)
+        pred_safe = torch.clamp(pred, min=1e-6, max=1.0 - 1e-6)
+        pred_flat = pred_safe.contiguous().view(pred_safe.size(0), -1)
         target_flat = target.contiguous().view(target.size(0), -1)
 
         intersection = (pred_flat * target_flat).sum(dim=1)

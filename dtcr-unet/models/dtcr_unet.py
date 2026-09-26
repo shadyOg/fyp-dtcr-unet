@@ -35,7 +35,7 @@ def compute_gradient_norm(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     grad_y = F.conv2d(pad_z, sobel_y)
 
     grad_norm_sq = grad_x**2 + grad_y**2
-    grad_norm = torch.sqrt(torch.clamp(grad_norm_sq, min=1e-7))
+    grad_norm = torch.sqrt(grad_norm_sq + 1e-6)
 
     return grad_norm, grad_norm_sq
 
@@ -60,11 +60,10 @@ def inverse_level_set_transform(
     Returns:
         Transformed segmentation probability map (shape: B, 1, H, W) bounded in [0, 1].
     """
-    # In our level set convention, z < 0 inside lesion, z > 0 outside.
-    # Sigmoid(-k * z) maps inside (negative) to -> 1.0 (high probability).
-    sig_z = torch.sigmoid(-k * z)
+    z_clamped = torch.clamp(z, -5.0, 5.0)
+    sig_z = torch.sigmoid(-k * z_clamped)
 
-    grad_norm, grad_norm_sq = compute_gradient_norm(z)
+    grad_norm, grad_norm_sq = compute_gradient_norm(z_clamped)
     transformed = sig_z + lambda1 * grad_norm_sq + lambda2 * grad_norm
 
     return torch.clamp(transformed, 0.0, 1.0)
@@ -189,8 +188,8 @@ class DTCR_UNet(nn.Module):
         d4 = self.up4(d3, e1)               # (B, 64, H, W)
 
         # 4. Dual Task Predictions
-        f1_logits = self.seg_head(d4)       # Task 1: Segmentation logits (B, 1, H, W)
-        f2_lsf = self.lsf_head(d4)          # Task 2: Level Set Function (B, 1, H, W)
+        f1_logits = torch.clamp(self.seg_head(d4), min=-20.0, max=20.0)       # Task 1: Segmentation logits (B, 1, H, W)
+        f2_lsf = torch.clamp(self.lsf_head(d4), min=-5.0, max=5.0)            # Task 2: Level Set Function (B, 1, H, W)
 
         # 5. Differentiable Inverse Mapping for Consistency Regularization
         f2_trans = inverse_level_set_transform(f2_lsf)
