@@ -70,45 +70,51 @@ class ChannelContextualEnhancement(nn.Module):
         Returns:
             F_CCE: Channel-enhanced feature map of shape (B, C_sigma, token_h, token_w).
         """
-        b = encoder_features[0].size(0)
-        tokens = []
+        # Force entire attention computation in FP32 to prevent GradScaler
+        # overflow/underflow death spiral in both forward AND backward passes.
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            b = encoder_features[0].size(0)
+            tokens = []
 
-        # 1. Channel alignment and tokenization (Eq. 11 & 12)
-        for i, (conv, feat) in enumerate(zip(self.align_convs, encoder_features)):
-            aligned = conv(feat)  # (B, C, H_i, W_i)
-            # Pool to common spatial token size
-            pooled = F.adaptive_avg_pool2d(aligned, self.token_size)  # (B, C, h0, w0)
-            tokens.append(pooled)
+            # Cast inputs to FP32
+            encoder_features_fp32 = [f.float() for f in encoder_features]
 
-        # 2. Multi-scale feature concatenation along channel dimension (Eq. 13)
-        # T_sigma shape: (B, C_sigma, h0, w0) -> flattened to (B, C_sigma, d) where d = h0 * w0
-        t_sigma_spatial = torch.cat(tokens, dim=1)  # (B, C_sigma, h0, w0)
-        h0, w0 = t_sigma_spatial.shape[2], t_sigma_spatial.shape[3]
-        d = h0 * w0
-        t_sigma = t_sigma_spatial.flatten(2)  # (B, C_sigma, d)
+            # 1. Channel alignment and tokenization (Eq. 11 & 12)
+            for i, (conv, feat) in enumerate(zip(self.align_convs, encoder_features_fp32)):
+                aligned = conv(feat)  # (B, C, H_i, W_i)
+                # Pool to common spatial token size
+                pooled = F.adaptive_avg_pool2d(aligned, self.token_size)  # (B, C, h0, w0)
+                tokens.append(pooled)
 
-        # Transpose for linear projection across channel vectors: (B, d, C_sigma)
-        t_trans = t_sigma.transpose(1, 2)
-        q_c = self.q_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
-        k_c = self.k_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
-        v_c = self.v_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
+            # 2. Multi-scale feature concatenation along channel dimension (Eq. 13)
+            # T_sigma shape: (B, C_sigma, h0, w0) -> flattened to (B, C_sigma, d) where d = h0 * w0
+            t_sigma_spatial = torch.cat(tokens, dim=1)  # (B, C_sigma, h0, w0)
+            h0, w0 = t_sigma_spatial.shape[2], t_sigma_spatial.shape[3]
+            d = h0 * w0
+            t_sigma = t_sigma_spatial.flatten(2)  # (B, C_sigma, d)
 
-        # 3. Channel dot-product attention matrix M_c (Eq. 15) in FP32 for numerical stability
-        scale = float(self.full_dim) ** 0.5
-        sim = torch.bmm(q_c.float(), k_c.transpose(1, 2).float()) / scale
-        sim_max = torch.max(sim, dim=-1, keepdim=True)[0]
-        m_c = F.softmax(sim - sim_max, dim=-1).to(v_c.dtype)
+            # Transpose for linear projection across channel vectors: (B, d, C_sigma)
+            t_trans = t_sigma.transpose(1, 2)
+            q_c = self.q_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
+            k_c = self.k_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
+            v_c = self.v_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
 
-        # 4. Weight value matrix and residual connection: (B, C_sigma, d)
-        attended = torch.bmm(m_c, v_c) + t_sigma
+            # 3. Channel dot-product attention matrix M_c (Eq. 15)
+            scale = float(self.full_dim) ** 0.5
+            sim = torch.bmm(q_c, k_c.transpose(1, 2)) / scale
+            sim_max = torch.max(sim, dim=-1, keepdim=True)[0]
+            m_c = F.softmax(sim - sim_max, dim=-1)
 
-        # 5. Global Channel Pooling (GCP) calibration (Eq. 16)
-        # GAP across sequence dimension d
-        gap = attended.mean(dim=-1)  # (B, C_sigma)
-        gamma = self.fc_gamma(gap).unsqueeze(-1)  # (B, C_sigma, 1)
-        beta = self.fc_beta(gap).unsqueeze(-1)    # (B, C_sigma, 1)
+            # 4. Weight value matrix and residual connection: (B, C_sigma, d)
+            attended = torch.bmm(m_c, v_c) + t_sigma
 
-        f_cce_flat = gamma * attended + beta  # (B, C_sigma, d)
-        f_cce = f_cce_flat.view(b, self.full_dim, h0, w0)
+            # 5. Global Channel Pooling (GCP) calibration (Eq. 16)
+            # GAP across sequence dimension d
+            gap = attended.mean(dim=-1)  # (B, C_sigma)
+            gamma = self.fc_gamma(gap).unsqueeze(-1)  # (B, C_sigma, 1)
+            beta = self.fc_beta(gap).unsqueeze(-1)    # (B, C_sigma, 1)
+
+            f_cce_flat = gamma * attended + beta  # (B, C_sigma, d)
+            f_cce = f_cce_flat.view(b, self.full_dim, h0, w0)
 
         return f_cce

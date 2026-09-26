@@ -61,35 +61,39 @@ class MultiScaleGlobalSpatial(nn.Module):
         Returns:
             F_multi_MSGS: Multi-scale spatial-enhanced feature map of shape (B, out_channels, H, W).
         """
-        b, c, h, w = f_cce.shape
-        n = h * w
+        # Force entire spatial attention in FP32 to prevent GradScaler
+        # overflow/underflow death spiral in both forward AND backward passes.
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            f_cce = f_cce.float()
+            b, c, h, w = f_cce.shape
+            n = h * w
 
-        # 1. 1x1 conv transformations (Eq. 17)
-        q_s = self.q_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
-        k_s = self.k_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
-        v_s = self.v_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
+            # 1. 1x1 conv transformations (Eq. 17)
+            q_s = self.q_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
+            k_s = self.k_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
+            v_s = self.v_conv(f_cce).view(b, self.out_channels, n)  # (B, C, N)
 
-        # 2. Scaled Dot-Product Spatial Similarity matrix M_s (Eq. 19) in FP32 for numerical stability
-        scale = float(self.out_channels) ** 0.5
-        sim_s = torch.bmm(q_s.transpose(1, 2).float(), k_s.float()) / scale
-        sim_s_max = torch.max(sim_s, dim=-1, keepdim=True)[0]
-        m_s = F.softmax(sim_s - sim_s_max, dim=-1).to(v_s.dtype)  # (B, N, N)
+            # 2. Scaled Dot-Product Spatial Similarity matrix M_s (Eq. 19)
+            scale = float(self.out_channels) ** 0.5
+            sim_s = torch.bmm(q_s.transpose(1, 2), k_s) / scale
+            sim_s_max = torch.max(sim_s, dim=-1, keepdim=True)[0]
+            m_s = F.softmax(sim_s - sim_s_max, dim=-1)  # (B, N, N)
 
-        # 3. Spatial attention weighting and residual connection (Eq. 20)
-        attended_s = torch.bmm(v_s, m_s.transpose(1, 2)).view(b, self.out_channels, h, w)
-        residual = self.res_proj(f_cce)
-        f_msgs = attended_s + residual  # (B, C, H, W)
+            # 3. Spatial attention weighting and residual connection (Eq. 20)
+            attended_s = torch.bmm(v_s, m_s.transpose(1, 2)).view(b, self.out_channels, h, w)
+            residual = self.res_proj(f_cce)
+            f_msgs = attended_s + residual  # (B, C, H, W)
 
-        # 4. Multi-scale convolutional filter fusion (3x3, 5x5, 7x7) (Eq. 21)
-        feat_3 = self.conv3x3(f_msgs)
-        feat_5 = self.conv5x5(f_msgs)
-        feat_7 = self.conv7x7(f_msgs)
+            # 4. Multi-scale convolutional filter fusion (3x3, 5x5, 7x7) (Eq. 21)
+            feat_3 = self.conv3x3(f_msgs)
+            feat_5 = self.conv5x5(f_msgs)
+            feat_7 = self.conv7x7(f_msgs)
 
-        norm_weights = F.softmax(self.scale_weights, dim=0)
-        f_multi_msgs = (
-            norm_weights[0] * feat_3 +
-            norm_weights[1] * feat_5 +
-            norm_weights[2] * feat_7
-        )
+            norm_weights = F.softmax(self.scale_weights, dim=0)
+            f_multi_msgs = (
+                norm_weights[0] * feat_3 +
+                norm_weights[1] * feat_5 +
+                norm_weights[2] * feat_7
+            )
 
         return f_multi_msgs

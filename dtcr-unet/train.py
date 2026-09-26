@@ -41,6 +41,8 @@ def train_one_epoch(
     model.train()
     running_losses = {"total": 0.0, "seg": 0.0, "lsf": 0.0, "dtc": 0.0}
     total_batches = len(loader)
+    actual_trained_batches = 0  # Count batches that actually contributed to training
+    skipped_batches = 0  # Count batches skipped by GradScaler or NaN
 
     optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{max_epochs} [Train]")
@@ -71,14 +73,22 @@ def train_one_epoch(
         # Check if loss is finite before backward
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
+            skipped_batches += 1
             continue
 
         if use_amp and device.type == "cuda":
             scaler.scale(scaled_loss).backward()
             if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Check if unscaled gradients are finite
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
+                    actual_trained_batches += 1
+                else:
+                    skipped_batches += 1
+
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
@@ -87,6 +97,7 @@ def train_one_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                actual_trained_batches += 1
 
         running_losses["total"] += loss_dict["loss_total"]
         running_losses["seg"] += loss_dict["loss_seg"]
@@ -100,7 +111,21 @@ def train_one_epoch(
             "DTC": f"{loss_dict['loss_dtc']:.4f}",
         })
 
-    avg_losses = {k: v / max(total_batches, 1) for k, v in running_losses.items()}
+    # GradScaler recovery: if too many batches were skipped, reset the scaler
+    # to prevent the death spiral where scale keeps shrinking until all batches underflow.
+    if use_amp and device.type == "cuda":
+        current_scale = scaler.get_scale()
+        skip_ratio = skipped_batches / max(total_batches, 1)
+        if skip_ratio > 0.5 or current_scale < 1.0:
+            print(f"  [GradScaler Recovery] scale={current_scale:.1f}, skipped={skipped_batches}/{total_batches} "
+                  f"({skip_ratio:.0%}) — resetting scale to 2^16")
+            scaler.update(new_scale=2**16)
+
+    # Average over actual contributing batches (not total) to avoid artificially low loss
+    divisor = max(total_batches, 1)  # Use total for consistent loss magnitude reporting
+    avg_losses = {k: v / divisor for k, v in running_losses.items()}
+    avg_losses["_actual_batches"] = actual_trained_batches
+    avg_losses["_skipped_batches"] = skipped_batches
     return avg_losses
 
 
@@ -219,6 +244,10 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
         }
         history.append(epoch_log)
 
+        skipped_info = ""
+        if train_losses.get("_skipped_batches", 0) > 0:
+            skipped_info = f" | Skipped: {train_losses['_skipped_batches']} batches"
+
         print(
             f"Epoch {epoch + 1:02d}/{cfg.epochs} ({elapsed:.1f}s) | "
             f"Train Loss: {train_losses['total']:.4f} | "
@@ -226,6 +255,7 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
             f"Val F1: {val_metrics['f1']:.2f}% | "
             f"Val HD: {val_metrics['hd']:.2f}px | "
             f"{'(Best!)' if is_best else ''}"
+            f"{skipped_info}"
         )
 
         # Save Checkpoint
