@@ -1,7 +1,8 @@
-"""Main Training Script for DTCR-U-Net.
+"""Main Training Script for DTCR-U-Net with Mixed Precision (AMP).
 
 Runs Dual-Task Semi-Supervised Training with AdamW, Cosine Annealing learning rate schedule,
-dynamic consistency loss ramp-up, and automated checkpointing matching Section 4 of the paper.
+Automatic Mixed Precision (AMP) for peak memory efficiency, dynamic consistency loss ramp-up,
+and automated checkpointing matching Section 4 of the paper.
 """
 
 import argparse
@@ -13,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
@@ -27,42 +29,56 @@ def train_one_epoch(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
     criterion: DTCRTotalLoss,
     device: torch.device,
     epoch: int,
     max_epochs: int,
+    grad_accum_steps: int = 1,
+    use_amp: bool = True,
 ) -> dict:
-    """Run one epoch of training."""
+    """Run one epoch of training with AMP and gradient accumulation."""
     model.train()
     running_losses = {"total": 0.0, "seg": 0.0, "lsf": 0.0, "dtc": 0.0}
     total_batches = len(loader)
 
+    optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{max_epochs} [Train]")
-    for batch in pbar:
+
+    for step, batch in enumerate(pbar):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         level_sets = batch["level_set"].to(device, non_blocking=True)
         is_labeled = batch["is_labeled"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        with autocast(enabled=use_amp and device.type == "cuda"):
+            # Forward pass
+            f1_logits, f2_lsf, f2_trans = model(images)
 
-        # Forward pass
-        f1_logits, f2_lsf, f2_trans = model(images)
+            # Compute dual-task loss
+            loss, loss_dict = criterion(
+                f1_logits=f1_logits,
+                f2_lsf=f2_lsf,
+                f2_trans=f2_trans,
+                target_mask=masks,
+                target_lsf=level_sets,
+                is_labeled_mask=is_labeled,
+                epoch=epoch,
+                max_epochs=max_epochs,
+            )
+            loss = loss / grad_accum_steps
 
-        # Compute dual-task loss
-        loss, loss_dict = criterion(
-            f1_logits=f1_logits,
-            f2_lsf=f2_lsf,
-            f2_trans=f2_trans,
-            target_mask=masks,
-            target_lsf=level_sets,
-            is_labeled_mask=is_labeled,
-            epoch=epoch,
-            max_epochs=max_epochs,
-        )
-
-        loss.backward()
-        optimizer.step()
+        if use_amp and device.type == "cuda":
+            scaler.scale(loss).backward()
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+        else:
+            loss.backward()
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == total_batches:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         running_losses["total"] += loss_dict["loss_total"]
         running_losses["seg"] += loss_dict["loss_seg"]
@@ -84,6 +100,7 @@ def evaluate_dataset(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
+    use_amp: bool = True,
 ) -> dict:
     """Evaluate model on validation or test set."""
     model.eval()
@@ -94,8 +111,9 @@ def evaluate_dataset(
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].cpu().numpy()
 
-            f1_logits, _, _ = model(images)
-            probs = torch.sigmoid(f1_logits).cpu().numpy()
+            with autocast(enabled=use_amp and device.type == "cuda"):
+                f1_logits, _, _ = model(images)
+                probs = torch.sigmoid(f1_logits).float().cpu().numpy()
 
             for i in range(len(probs)):
                 m = compute_binary_metrics(probs[i, 0], masks[i, 0])
@@ -108,10 +126,10 @@ def evaluate_dataset(
     return mean_metrics
 
 
-def train(cfg: DTCRConfig):
+def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
     """Main training execution function."""
     device = torch.device(cfg.device)
-    print(f"Using device: {device}")
+    print(f"Using device: {device} | AMP Mixed Precision: {use_amp}")
 
     # 1. Prepare DataLoaders
     train_loader, val_loader, test_loader = get_dataloaders(
@@ -149,6 +167,8 @@ def train(cfg: DTCRConfig):
         eta_min=cfg.min_lr,
     )
 
+    scaler = GradScaler(enabled=use_amp and device.type == "cuda")
+
     best_val_dice = 0.0
     history = []
 
@@ -164,13 +184,16 @@ def train(cfg: DTCRConfig):
             model=model,
             loader=train_loader,
             optimizer=optimizer,
+            scaler=scaler,
             criterion=criterion,
             device=device,
             epoch=epoch,
             max_epochs=cfg.epochs,
+            grad_accum_steps=grad_accum_steps,
+            use_amp=use_amp,
         )
 
-        val_metrics = evaluate_dataset(model, val_loader, device)
+        val_metrics = evaluate_dataset(model, val_loader, device, use_amp=use_amp)
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -211,6 +234,10 @@ def train(cfg: DTCRConfig):
             filename="last_model.pth",
         )
 
+        # Clean GPU memory cache
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # Save final training history
     with open(os.path.join(cfg.output_dir, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
@@ -222,9 +249,11 @@ def main():
     parser = argparse.ArgumentParser(description="Train DTCR-U-Net")
     parser.add_argument("--data", default="data/processed", help="Path to preprocessed dataset")
     parser.add_argument("--epochs", type=int, default=80, help="Total training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
+    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
     parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio")
+    parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--outputs", default="outputs", help="Directory to save logs and results")
     args = parser.parse_args()
@@ -239,7 +268,7 @@ def main():
         output_dir=args.outputs,
     )
 
-    train(cfg)
+    train(cfg, grad_accum_steps=args.grad_accum, use_amp=not args.no_amp)
 
 
 if __name__ == "__main__":

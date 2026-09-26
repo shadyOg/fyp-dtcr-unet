@@ -1,7 +1,8 @@
 """Multi-Scale Skip Connection (MsSC) Scheme for DTCR-U-Net.
 
 Implements Cascade, Residual, and Dense skip connectivity across hierarchical
-encoder-decoder stages as described in Section 3.3 (Equations 27-30) of the paper.
+encoder-decoder stages as described in Section 3.3 (Equations 27-30) of the paper,
+optimized with 1x1 channel projection before upsampling to preserve GPU memory.
 """
 
 import torch
@@ -25,11 +26,27 @@ class MultiScaleSkipConnection(nn.Module):
         """
         super().__init__()
         self.out_channels = out_channels
-        total_in_channels = sum(in_channels_list)
+
+        # 1x1 projections to reduce channels before upsampling (saves huge VRAM)
+        self.channel_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_c, out_channels // len(in_channels_list), kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels // len(in_channels_list)),
+                nn.ReLU(inplace=True),
+            ) if in_c > out_channels // len(in_channels_list) else nn.Identity()
+            for in_c in in_channels_list
+        ])
+
+        # Calculate effective concatenated channels after projections
+        proj_channels = [
+            out_channels // len(in_channels_list) if in_c > out_channels // len(in_channels_list) else in_c
+            for in_c in in_channels_list
+        ]
+        total_proj_channels = sum(proj_channels)
 
         # Dense connection fusion conv F(Concat([...])) (Eq. 29 & 30)
         self.dense_conv = nn.Sequential(
-            nn.Conv2d(total_in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(total_proj_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -71,16 +88,17 @@ class MultiScaleSkipConnection(nn.Module):
         """
         target_size = (features[0].shape[2], features[0].shape[3])
 
-        # 1. Resample all features to match F_low spatial resolution
+        # 1. Project channels first, then resample to match F_low spatial resolution
         aligned_features = []
-        for feat in features:
-            if (feat.shape[2], feat.shape[3]) != target_size:
-                aligned_features.append(F.interpolate(feat, size=target_size, mode="bilinear", align_corners=True))
+        for proj, feat in zip(self.channel_projs, features):
+            projected = proj(feat)
+            if (projected.shape[2], projected.shape[3]) != target_size:
+                aligned_features.append(F.interpolate(projected, size=target_size, mode="bilinear", align_corners=True))
             else:
-                aligned_features.append(feat)
+                aligned_features.append(projected)
 
-        f_low = aligned_features[0]
-        f_high = aligned_features[-1]
+        f_low = features[0]
+        f_high = features[-1]
 
         # 2. Dense connection (Eq. 29)
         f_concat = torch.cat(aligned_features, dim=1)  # Concat([F_low, F_mid, F_high])
