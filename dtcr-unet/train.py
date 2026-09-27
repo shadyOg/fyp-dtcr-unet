@@ -135,9 +135,10 @@ def evaluate_dataset(
     device: torch.device,
     use_amp: bool = True,
 ) -> dict:
-    """Evaluate model on validation or test set."""
+    """Evaluate model on validation or test set, computing overall and lesion-only slice metrics."""
     model.eval()
     all_metrics = []
+    lesion_metrics = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Evaluating]", leave=False):
@@ -151,10 +152,19 @@ def evaluate_dataset(
             for i in range(len(probs)):
                 m = compute_binary_metrics(probs[i, 0], masks[i, 0])
                 all_metrics.append(m)
+                if masks[i, 0].sum() > 0:
+                    lesion_metrics.append(m)
 
     mean_metrics = {}
     for k in all_metrics[0].keys():
         mean_metrics[k] = float(np.mean([m[k] for m in all_metrics]))
+
+    if lesion_metrics:
+        mean_metrics["lesion_dice"] = float(np.mean([m["dice"] for m in lesion_metrics]))
+        mean_metrics["lesion_count"] = len(lesion_metrics)
+    else:
+        mean_metrics["lesion_dice"] = mean_metrics["dice"]
+        mean_metrics["lesion_count"] = 0
 
     return mean_metrics
 
@@ -265,7 +275,7 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
             f"Epoch {epoch + 1:02d}/{cfg.epochs} ({elapsed:.1f}s) | "
             f"LR: {current_lr:.2e} | "
             f"Train Loss: {train_losses['total']:.4f} | "
-            f"Val Dice: {val_dice:.2f}% | "
+            f"Val Dice: {val_dice:.2f}% (Lesion: {val_metrics['lesion_dice']:.2f}%) | "
             f"Val SE: {val_metrics['sensitivity']:.2f}% | "
             f"Val SP: {val_metrics['specificity']:.2f}% | "
             f"Val Acc: {val_metrics['accuracy']:.2f}% | "

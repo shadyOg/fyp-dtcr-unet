@@ -6,6 +6,7 @@ from glob import glob
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -45,15 +46,31 @@ class DualTaskDataset(Dataset):
         if len(self.img_paths) == 0:
             raise RuntimeError(f"No .npy images found in {self.data_dir / 'images'}")
 
-        # Determine which samples are labeled in semi-supervised training
+        # Determine which samples are labeled in semi-supervised training while keeping patient-level integrity
         self.is_labeled_list = [True] * len(self.img_paths)
         if split == "train" and labeled_ratio < 1.0:
-            rng = random.Random(seed)
-            indices = list(range(len(self.img_paths)))
-            rng.shuffle(indices)
-            num_labeled = int(round(len(indices) * labeled_ratio))
-            labeled_set = set(indices[:num_labeled])
-            self.is_labeled_list = [(i in labeled_set) for i in range(len(self.img_paths))]
+            stems_file = self.data_dir / "labeled_stems.txt"
+            if stems_file.exists():
+                with open(stems_file, "r") as f:
+                    labeled_stems = set(line.strip() for line in f if line.strip())
+                self.is_labeled_list = [(Path(p).stem in labeled_stems) for p in self.img_paths]
+            else:
+                rng = random.Random(seed)
+                patient_map: Dict[str, List[int]] = {}
+                for i, p in enumerate(self.img_paths):
+                    stem = Path(p).stem
+                    pid = stem.rsplit("_s", 1)[0] if "_s" in stem else stem
+                    patient_map.setdefault(pid, []).append(i)
+
+                unique_patients = sorted(patient_map.keys())
+                rng.shuffle(unique_patients)
+                num_labeled_patients = int(round(len(unique_patients) * labeled_ratio))
+                labeled_patients = set(unique_patients[:num_labeled_patients])
+
+                self.is_labeled_list = [False] * len(self.img_paths)
+                for pid in labeled_patients:
+                    for idx in patient_map[pid]:
+                        self.is_labeled_list[idx] = True
 
     def __len__(self) -> int:
         return len(self.img_paths)
@@ -81,10 +98,46 @@ class DualTaskDataset(Dataset):
             mask = np.rot90(mask, k).copy()
             lsf = np.rot90(lsf, k).copy()
 
-        # Subtle intensity jitter (image only)
+        # Random scale and crop / pad (zoom 0.85x to 1.15x)
         if random.random() > 0.5:
-            gamma = random.uniform(0.9, 1.1)
+            scale = random.uniform(0.85, 1.15)
+            h, w = img.shape
+            new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+            img_s = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            mask_s = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            lsf_s = cv2.resize(lsf, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            if scale >= 1.0:
+                sh = (new_h - h) // 2
+                sw = (new_w - w) // 2
+                img = img_s[sh:sh+h, sw:sw+w]
+                mask = mask_s[sh:sh+h, sw:sw+w]
+                lsf = lsf_s[sh:sh+h, sw:sw+w]
+            else:
+                ph = (h - new_h) // 2
+                pw = (w - new_w) // 2
+                img = np.pad(img_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="constant", constant_values=0)
+                mask = np.pad(mask_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="constant", constant_values=0)
+                lsf = np.pad(lsf_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="edge")
+
+        # Subtle intensity jitter (gamma)
+        if random.random() > 0.5:
+            gamma = random.uniform(0.85, 1.15)
             img = np.clip(img ** gamma, 0.0, 1.0)
+
+        # Intensity shift
+        if random.random() > 0.3:
+            shift = random.uniform(-0.05, 0.05)
+            img = np.clip(img + shift, 0.0, 1.0)
+
+        # Gaussian noise
+        if random.random() > 0.3:
+            noise = np.random.normal(0, 0.02, img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0.0, 1.0)
+
+        # Gaussian blur
+        if random.random() > 0.3:
+            img = cv2.GaussianBlur(img, (3, 3), sigmaX=random.uniform(0.3, 0.8))
 
         return img, mask, lsf
 

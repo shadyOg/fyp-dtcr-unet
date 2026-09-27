@@ -243,6 +243,7 @@ def process_mosmed_dataset(
 
     counts = {"train": 0, "val": 0, "test": 0}
     labeled_counts = {"train_labeled": 0, "train_unlabeled": 0}
+    train_labeled_stems = []
 
     study_to_paths = {Path(c).stem.replace(".nii", ""): (c, m) for c, m in zip(ct_files, mask_files)}
 
@@ -281,8 +282,13 @@ def process_mosmed_dataset(
                 if split_name == "train":
                     if is_labeled:
                         labeled_counts["train_labeled"] += 1
+                        train_labeled_stems.append(stem)
                     else:
                         labeled_counts["train_unlabeled"] += 1
+
+    if train_labeled_stems:
+        with open(out_path / "train" / "labeled_stems.txt", "w") as f:
+            f.write("\n".join(train_labeled_stems) + "\n")
 
     manifest = {
         "dataset": "MosMedData",
@@ -544,6 +550,7 @@ def process_lidc_dataset(
 
     counts = {"train": 0, "val": 0, "test": 0}
     labeled_counts = {"train_labeled": 0, "train_unlabeled": 0}
+    train_labeled_stems = []
     skipped = {"no_ct": 0, "no_xml": 0, "no_nodules": 0, "error": 0}
 
     # 5. Process each patient
@@ -625,12 +632,19 @@ def process_lidc_dataset(
                 if split_name == "train":
                     if is_labeled:
                         labeled_counts["train_labeled"] += 1
+                        train_labeled_stems.append(stem)
                     else:
                         labeled_counts["train_unlabeled"] += 1
 
         except Exception as e:
             skipped["error"] += 1
             continue
+
+    if train_labeled_stems:
+        stems_file = out_path / "train" / "labeled_stems.txt"
+        mode = "a" if stems_file.exists() else "w"
+        with open(stems_file, mode) as f:
+            f.write("\n".join(train_labeled_stems) + "\n")
 
     manifest = {
         "dataset": "LIDC-IDRI",
