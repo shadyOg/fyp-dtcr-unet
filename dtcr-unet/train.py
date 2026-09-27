@@ -196,7 +196,7 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
         lambda1=cfg.lambda1,
         lambda2=cfg.lambda2,
         beta=cfg.beta,
-    )
+    ).to(device)
 
     optimizer = optim.AdamW(
         model.parameters(),

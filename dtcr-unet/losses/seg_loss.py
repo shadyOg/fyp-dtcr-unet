@@ -87,7 +87,8 @@ class SupervisedSegLoss(nn.Module):
         if self.use_focal:
             bce = self.focal_loss(logits, target)
         else:
-            bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=self.pw)
+            pw = self.pw.to(device=logits.device, dtype=logits.dtype)
+            bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
 
         probs = torch.sigmoid(logits)
         dice = self.dice_loss(probs, target)
