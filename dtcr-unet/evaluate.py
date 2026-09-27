@@ -31,6 +31,8 @@ def evaluate_checkpoint(
     """Load model checkpoint and run comprehensive test set evaluation."""
     dev = torch.device(device)
     os.makedirs(output_dir, exist_ok=True)
+    comparisons_dir = os.path.join(output_dir, "comparisons")
+    os.makedirs(comparisons_dir, exist_ok=True)
 
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=dev)
@@ -82,7 +84,7 @@ def evaluate_checkpoint(
                     axes[3].axis("off")
 
                     plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, f"test_sample_{saved_vis_count + 1}.png"))
+                    plt.savefig(os.path.join(comparisons_dir, f"test_sample_{saved_vis_count + 1}.png"), dpi=120, bbox_inches="tight")
                     plt.close()
                     saved_vis_count += 1
 
@@ -116,6 +118,7 @@ def main():
     parser.add_argument("--data", default="data/processed", help="Path to preprocessed dataset")
     parser.add_argument("--out", default="outputs/evaluation", help="Output directory for results")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--save-vis", type=int, default=20, help="Number of qualitative comparisons to save (0 to disable)")
     args = parser.parse_args()
 
     evaluate_checkpoint(
@@ -123,6 +126,7 @@ def main():
         data_dir=args.data,
         output_dir=args.out,
         batch_size=args.batch_size,
+        save_visualizations=args.save_vis,
     )
 
 

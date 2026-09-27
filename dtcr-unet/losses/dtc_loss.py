@@ -22,11 +22,14 @@ def compute_spatial_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     return grad_x, grad_y
 
 
-def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int, max_weight: float = 0.1) -> float:
+def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int, max_weight: float = 1.0) -> float:
     """Calculate the Gaussian ramp-up consistency weight lambda_d(t).
 
     Per Eq. (10) of the paper:
         lambda_d(t) = max_weight * exp(-5 * (1 - t / t_max)^2)
+
+    max_weight=1.0 matches the paper: consistency becomes equal to supervised
+    loss strength at the end of training, fully exploiting unlabeled samples.
     """
     if max_epochs <= 0:
         return max_weight

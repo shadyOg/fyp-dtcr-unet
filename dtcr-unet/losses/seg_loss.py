@@ -34,13 +34,20 @@ class DiceLoss(nn.Module):
 
 
 class SupervisedSegLoss(nn.Module):
-    """Segmentation Loss with balanced BCE and Dice components to prevent background collapse."""
+    """Segmentation Loss with balanced BCE and Dice components to prevent background collapse.
 
-    def __init__(self, bce_weight: float = 1.0, dice_weight: float = 1.0, smooth: float = 1.0):
+    Uses pos_weight in BCE to compensate for lesion/background class imbalance
+    (~1:100 in lung CT scans). pos_weight=10 means false negatives are penalised 10×
+    more than false positives, forcing the model to detect lesions rather than
+    collapsing to all-background.
+    """
+
+    def __init__(self, bce_weight: float = 1.0, dice_weight: float = 1.0, smooth: float = 1.0, pos_weight: float = 10.0):
         super().__init__()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        # Register as buffer so it automatically moves to the correct device
+        self.register_buffer("pw", torch.tensor([pos_weight]))
         self.dice_loss = DiceLoss(smooth=smooth)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -49,7 +56,7 @@ class SupervisedSegLoss(nn.Module):
             logits: Unnormalized logits from segmentation head f1(x) of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        bce = self.bce_loss(logits, target)
+        bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=self.pw)
         probs = torch.sigmoid(logits)
         dice = self.dice_loss(probs, target)
 

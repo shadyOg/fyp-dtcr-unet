@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 from config import DTCRConfig
@@ -194,10 +194,22 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
         weight_decay=cfg.weight_decay,
     )
 
-    scheduler = CosineAnnealingLR(
+    warmup_epochs = 5
+    warmup_scheduler = LinearLR(
         optimizer,
-        T_max=cfg.epochs,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(cfg.epochs - warmup_epochs, 1),
         eta_min=cfg.min_lr,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
     )
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
@@ -248,13 +260,18 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
         if train_losses.get("_skipped_batches", 0) > 0:
             skipped_info = f" | Skipped: {train_losses['_skipped_batches']} batches"
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch + 1:02d}/{cfg.epochs} ({elapsed:.1f}s) | "
+            f"LR: {current_lr:.2e} | "
             f"Train Loss: {train_losses['total']:.4f} | "
             f"Val Dice: {val_dice:.2f}% | "
+            f"Val SE: {val_metrics['sensitivity']:.2f}% | "
+            f"Val SP: {val_metrics['specificity']:.2f}% | "
+            f"Val Acc: {val_metrics['accuracy']:.2f}% | "
             f"Val F1: {val_metrics['f1']:.2f}% | "
-            f"Val HD: {val_metrics['hd']:.2f}px | "
-            f"{'(Best!)' if is_best else ''}"
+            f"Val HD: {val_metrics['hd']:.2f}px"
+            f"{' | (Best!)' if is_best else ''}"
             f"{skipped_info}"
         )
 
@@ -289,7 +306,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=80, help="Total training epochs")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
     parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate")
     parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")

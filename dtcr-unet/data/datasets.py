@@ -99,10 +99,6 @@ class DualTaskDataset(Dataset):
         mask = np.load(mask_path).astype(np.float32) if mask_path.exists() else np.zeros_like(img)
         lsf = np.load(lsf_path).astype(np.float32) if lsf_path.exists() else np.zeros_like(img)
 
-        # Ensure LSF is normalized to roughly [-1, 1] range even if unnormalized .npy on disk
-        if np.abs(lsf).max() > 2.0:
-            lsf = lsf / max(lsf.shape[-2], lsf.shape[-1], 256.0)
-
         if self.transform:
             img, mask, lsf = self._augment(img, mask, lsf)
 
