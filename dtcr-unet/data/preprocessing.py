@@ -39,17 +39,16 @@ def compute_level_set(mask_2d: np.ndarray, lambda_smooth: float = 0.3) -> np.nda
     mask_bool = mask_2d > 0
 
     if not np.any(mask_bool):
-        # Empty mask (no lesion in this slice) -> entire slice is outside
-        # Distance to nearest boundary is max image distance
+        # Empty mask (no lesion in this slice) -> entire slice is outside lesion
+        # Normalized distance is +1.0 (maximum distance outside)
         h, w = mask_2d.shape
-        max_dist = np.sqrt(h**2 + w**2)
-        return np.full((h, w), max_dist, dtype=np.float32)
+        return np.ones((h, w), dtype=np.float32)
 
     if np.all(mask_bool):
-        # Entire slice is lesion
+        # Entire slice is lesion -> entire slice is inside lesion
+        # Normalized distance is -1.0 (maximum distance inside)
         h, w = mask_2d.shape
-        max_dist = np.sqrt(h**2 + w**2)
-        return np.full((h, w), -max_dist, dtype=np.float32)
+        return -np.ones((h, w), dtype=np.float32)
 
     # Euclidean distance transform
     dist_out = distance_transform_edt(~mask_bool)
@@ -58,13 +57,13 @@ def compute_level_set(mask_2d: np.ndarray, lambda_smooth: float = 0.3) -> np.nda
     # Level set: negative inside, positive outside, normalized to [-1, 1]
     h, w = mask_2d.shape
     scale = float(max(h, w))
-    lsf = ((dist_out - dist_in) / scale).astype(np.float32)
+    lsf = np.clip(((dist_out - dist_in) / scale).astype(np.float32), -1.0, 1.0)
 
     # Optional gradient smoothing adjustment if lambda_smooth > 0
     if lambda_smooth > 0:
         grad_y, grad_x = np.gradient(lsf)
         grad_norm_sq = grad_x**2 + grad_y**2
-        lsf = lsf + lambda_smooth * grad_norm_sq
+        lsf = np.clip(lsf + lambda_smooth * grad_norm_sq, -1.0, 1.0)
 
     return lsf.astype(np.float32)
 

@@ -152,6 +152,9 @@ class DualTaskDataset(Dataset):
         mask = np.load(mask_path).astype(np.float32) if mask_path.exists() else np.zeros_like(img)
         lsf = np.load(lsf_path).astype(np.float32) if lsf_path.exists() else np.zeros_like(img)
 
+        # Ensure LSF values are strictly normalized to [-1.0, 1.0], fixing any unnormalized empty slices from disk
+        lsf = np.clip(lsf, -1.0, 1.0)
+
         if self.transform:
             img, mask, lsf = self._augment(img, mask, lsf)
 
@@ -164,12 +167,15 @@ class DualTaskDataset(Dataset):
             lsf = np.expand_dims(lsf, axis=0)
 
         is_labeled = self.is_labeled_list[idx]
+        patient_id = stem.rsplit("_s", 1)[0] if "_s" in stem else stem
 
         return {
             "image": torch.from_numpy(img).float(),
             "mask": torch.from_numpy(mask).float(),
             "level_set": torch.from_numpy(lsf).float(),
             "is_labeled": torch.tensor(is_labeled, dtype=torch.bool),
+            "stem": stem,
+            "patient_id": patient_id,
         }
 
 
