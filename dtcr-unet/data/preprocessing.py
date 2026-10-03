@@ -307,6 +307,253 @@ def process_mosmed_dataset(
     return manifest
 
 
+def find_covid19_files(covid_root: Union[str, Path]) -> Tuple[List[str], List[str]]:
+    """Find and pair CT scan NIfTI volumes with infection masks in COVID-19-CT-Seg.
+
+    Supports both metadata.csv lookup and recursive folder scanning for
+    coronacases and radiopaedia volumes.
+
+    Args:
+        covid_root: Root directory of COVID-19 CT dataset (e.g. /kaggle/input/covid19-ct-scans).
+
+    Returns:
+        Tuple of (list_of_ct_paths, list_of_mask_paths).
+    """
+    covid_path = Path(covid_root)
+
+    # 1. Try metadata.csv first
+    csv_candidates = list(covid_path.rglob("metadata.csv"))
+    if csv_candidates:
+        csv_file = csv_candidates[0]
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_file)
+            paired_ct = []
+            paired_masks = []
+            for _, row in df.iterrows():
+                ct_p = row.get("ct_scan")
+                mask_p = row.get("infection_mask")
+                if pd.isna(ct_p) or pd.isna(mask_p):
+                    continue
+
+                p_ct = Path(ct_p)
+                if not p_ct.exists():
+                    p_ct = csv_file.parent / Path(ct_p).name
+                if not p_ct.exists():
+                    cands = list(covid_path.rglob(Path(ct_p).name))
+                    if cands:
+                        p_ct = cands[0]
+
+                p_mask = Path(mask_p)
+                if not p_mask.exists():
+                    p_mask = csv_file.parent / Path(mask_p).name
+                if not p_mask.exists():
+                    cands = list(covid_path.rglob(Path(mask_p).name))
+                    if cands:
+                        p_mask = cands[0]
+
+                if p_ct.exists() and p_mask.exists():
+                    paired_ct.append(str(p_ct))
+                    paired_masks.append(str(p_mask))
+
+            if paired_ct:
+                return paired_ct, paired_masks
+        except Exception as e:
+            print(f"Warning: Failed reading metadata.csv ({e}), falling back to recursive scan.")
+
+    # 2. Direct glob / scan
+    all_niis = list(covid_path.rglob("*.nii*"))
+    ct_files = []
+    mask_files = []
+
+    for p in all_niis:
+        p_str = str(p).replace("\\", "/")
+        if "infection_mask" in p_str:
+            continue
+        if "lung_mask" in p_str or "lung_and_infection" in p_str:
+            continue
+        if "ct_scans" in p_str or "coronacases" in p.name.lower() or "radiopaedia" in p.name.lower():
+            # Find matching infection mask
+            target_name = p.name
+            mask_match = None
+            for m in all_niis:
+                m_str = str(m).replace("\\", "/")
+                if ("infection_mask" in m_str or "infection" in m.name.lower()) and m.name == target_name:
+                    mask_match = m
+                    break
+            if mask_match:
+                ct_files.append(str(p))
+                mask_files.append(str(mask_match))
+
+    return sorted(ct_files), sorted(mask_files)
+
+
+def process_covid19_dataset(
+    covid_root: str,
+    output_dir: str,
+    target_size: Tuple[int, int] = (256, 256),
+    context_slices: int = 1,
+    test_ratio: float = 0.2,
+    val_ratio: float = 0.2,
+    labeled_ratio: float = 0.4,
+    seed: int = 42,
+) -> Dict:
+    """Extract, preprocess, and save COVID-19-CT-Seg slices with patient-level split.
+
+    Args:
+        covid_root: Root folder containing COVID-19-CT-Seg dataset.
+        output_dir: Destination folder for preprocessed .npy files.
+        target_size: (H, W) resolution (default: (256, 256)).
+        context_slices: Neighboring slices to extract alongside each lesion slice.
+        test_ratio: Fraction for test set (default: 0.2).
+        val_ratio: Fraction of train+val for validation (default: 0.2).
+        labeled_ratio: Fraction of training set with labels (default: 0.4 per paper Table 4).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        Manifest dictionary with dataset statistics and saved counts.
+    """
+    out_path = Path(output_dir)
+    for split in ["train", "val", "test"]:
+        os.makedirs(out_path / split / "images", exist_ok=True)
+        os.makedirs(out_path / split / "masks", exist_ok=True)
+        os.makedirs(out_path / split / "level_sets", exist_ok=True)
+
+    ct_files, mask_files = find_covid19_files(covid_root)
+    print(f"Found {len(ct_files)} paired COVID-19-CT-Seg volumes.")
+
+    if not ct_files:
+        raise FileNotFoundError(f"No paired COVID-19 CT scans and infection masks found in {covid_root}")
+
+    # Build unique (case_id, slice_idx) slice registry with context
+    all_case_pairs: Dict[str, List[int]] = {}
+    case_to_paths = {}
+
+    for ct_path, mask_path in zip(ct_files, mask_files):
+        case_id = Path(ct_path).stem.replace(".nii", "")
+        case_to_paths[case_id] = (ct_path, mask_path)
+        mask_vol = nib.load(mask_path).get_fdata()
+        num_slices = mask_vol.shape[2] if mask_vol.ndim == 3 else 1
+
+        lesion_slices = []
+        for s in range(num_slices):
+            sl = mask_vol[:, :, s] if mask_vol.ndim == 3 else mask_vol
+            if (sl > 0).any():
+                lesion_slices.append(s)
+
+        if len(lesion_slices) == 0:
+            continue
+
+        selected_indices = set()
+        for s in lesion_slices:
+            for offset in range(-context_slices, context_slices + 1):
+                idx = s + offset
+                if 0 <= idx < num_slices:
+                    selected_indices.add(int(idx))
+
+        all_case_pairs[case_id] = sorted(selected_indices)
+
+    unique_cases = sorted(all_case_pairs.keys())
+    print(f"Total COVID-19 cases with annotated lesions: {len(unique_cases)}")
+
+    # Patient-level split: 6:2:2 ratio
+    train_val_cases, test_cases = train_test_split(
+        unique_cases, test_size=test_ratio, random_state=seed
+    )
+    val_rel_ratio = val_ratio / (1.0 - test_ratio)
+    train_cases, val_cases = train_test_split(
+        train_val_cases, test_size=val_rel_ratio, random_state=seed
+    )
+
+    splits_map = {
+        "train": train_cases,
+        "val": val_cases,
+        "test": test_cases,
+    }
+
+    print(
+        f"Split breakdown: Train={len(train_cases)} cases, "
+        f"Val={len(val_cases)} cases, Test={len(test_cases)} cases."
+    )
+
+    # Semi-supervised assignment on training set: pick labeled subset (e.g. 40%)
+    random.seed(seed)
+    shuffled_train = list(train_cases)
+    random.shuffle(shuffled_train)
+    num_labeled = int(round(len(shuffled_train) * labeled_ratio))
+    labeled_case_set = set(shuffled_train[:num_labeled])
+
+    counts = {"train": 0, "val": 0, "test": 0}
+    labeled_counts = {"train_labeled": 0, "train_unlabeled": 0}
+    train_labeled_stems = []
+
+    for split_name, case_list in splits_map.items():
+        pbar = tqdm(case_list, desc=f"Processing COVID-19 {split_name} split")
+        for case_id in pbar:
+            ct_path, mask_path = case_to_paths[case_id]
+            ct_vol = nib.load(ct_path).get_fdata()
+            mask_vol = nib.load(mask_path).get_fdata()
+
+            is_labeled = (split_name != "train") or (case_id in labeled_case_set)
+
+            for idx in all_case_pairs[case_id]:
+                ct_slice = ct_vol[:, :, idx] if ct_vol.ndim == 3 else ct_vol
+                mask_slice = mask_vol[:, :, idx] if mask_vol.ndim == 3 else mask_vol
+
+                # Rotate 90 degrees to standardize orientation if needed
+                ct_slice = np.rot90(np.array(ct_slice))
+                mask_slice = np.rot90(np.array(mask_slice))
+
+                # Preprocess CT image
+                ct_norm = normalize_ct_slice(ct_slice)
+                ct_resized = resize_slice(ct_norm, target_size=target_size, is_mask=False)
+
+                # Preprocess binary mask (lesion > 0)
+                mask_bin = (mask_slice > 0).astype(np.uint8)
+                mask_resized = resize_slice(mask_bin, target_size=target_size, is_mask=True)
+
+                # Compute Level Set map T(y)
+                lsf_map = compute_level_set(mask_resized)
+
+                stem = f"covid19_{case_id}_s{idx}"
+
+                # Save arrays
+                np.save(out_path / split_name / "images" / f"{stem}.npy", ct_resized)
+                np.save(out_path / split_name / "masks" / f"{stem}.npy", mask_resized)
+                np.save(out_path / split_name / "level_sets" / f"{stem}.npy", lsf_map)
+
+                counts[split_name] += 1
+                if split_name == "train":
+                    if is_labeled:
+                        labeled_counts["train_labeled"] += 1
+                        train_labeled_stems.append(stem)
+                    else:
+                        labeled_counts["train_unlabeled"] += 1
+
+    if train_labeled_stems:
+        stems_file = out_path / "train" / "labeled_stems.txt"
+        mode = "a" if stems_file.exists() else "w"
+        with open(stems_file, mode) as f:
+            f.write("\n".join(train_labeled_stems) + "\n")
+
+    manifest = {
+        "dataset": "COVID-19-CT-Seg",
+        "target_size": list(target_size),
+        "total_extracted_slices": sum(counts.values()),
+        "splits": counts,
+        "semi_supervised_breakdown": labeled_counts,
+        "labeled_ratio": labeled_ratio,
+        "seed": seed,
+    }
+
+    with open(out_path / "covid19_manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print("\nCOVID-19-CT-Seg preprocessing complete!")
+    print(json.dumps(manifest, indent=2))
+    return manifest
+
+
 def _find_ct_series_folder(patient_path: Path) -> Optional[str]:
     """Find the DICOM CT series folder under a patient directory."""
     import SimpleITK as sitk
@@ -671,6 +918,7 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess CT datasets for DTCR-U-Net")
     parser.add_argument("--mosmed", default=None, help="Path to MosMed dataset directory")
     parser.add_argument("--lidc", default=None, help="Path to LIDC-IDRI dataset directory (raw DICOM + XML)")
+    parser.add_argument("--covid19", default=None, help="Path to COVID-19-CT-Seg dataset directory (e.g. /kaggle/input/covid19-ct-scans)")
     parser.add_argument("--out", default="data/processed", help="Output directory for processed .npy files")
     parser.add_argument("--size", type=int, default=256, help="Target image size (e.g. 256 for 256x256)")
     parser.add_argument("--context", type=int, default=1, help="Number of adjacent context slices (+/-)")
@@ -679,8 +927,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    if args.mosmed is None and args.lidc is None:
-        parser.error("At least one of --mosmed or --lidc must be provided.")
+    if args.mosmed is None and args.lidc is None and args.covid19 is None:
+        parser.error("At least one of --mosmed, --lidc, or --covid19 must be provided.")
 
     if args.mosmed:
         process_mosmed_dataset(
@@ -698,6 +946,16 @@ def main():
             output_dir=args.out,
             target_size=(args.size, args.size),
             max_patients=args.max_patients,
+            context_slices=args.context,
+            labeled_ratio=args.labeled_ratio,
+            seed=args.seed,
+        )
+
+    if args.covid19:
+        process_covid19_dataset(
+            covid_root=args.covid19,
+            output_dir=args.out,
+            target_size=(args.size, args.size),
             context_slices=args.context,
             labeled_ratio=args.labeled_ratio,
             seed=args.seed,
