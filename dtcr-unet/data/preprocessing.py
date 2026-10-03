@@ -11,7 +11,7 @@ import os
 import random
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import nibabel as nib
