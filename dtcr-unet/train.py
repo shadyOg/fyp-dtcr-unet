@@ -365,7 +365,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Per-step batch size (default: 8)")
     parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4 -> effective batch 32 per paper)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (default: 0.001 per paper)")
-    parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4)")
+    parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4; use 1.0 for fully-supervised baseline)")
+    parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
+    parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--no-filter-val", action="store_true", help="Include empty background slices in validation")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")
@@ -378,6 +380,8 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         labeled_ratio=args.labeled_ratio,
+        lambda1=args.lambda1,
+        lambda2=args.lambda2,
         checkpoint_dir=args.checkpoints,
         output_dir=args.outputs,
     )

@@ -25,7 +25,7 @@ class DTCRConfig:
 
     # Loss hyperparameters (Section 4.6)
     beta: float = 0.5             # Gradient constraint weight for Supervised LSF loss
-    lambda1: float = 1.0          # Gradient consistency weight for Dual-Task Consistency loss
+    lambda1: float = 0.3          # Gradient consistency weight for Dual-Task Consistency loss (optimal per paper Fig.7)
     lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss
     lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter
 
