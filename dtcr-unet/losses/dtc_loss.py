@@ -76,8 +76,11 @@ class DualTaskConsistencyLoss(nn.Module):
 
         # 3. Interaction Enhancement Loss L_interact: ||f1(x) * f2(x)|| (Eq. 7)
         # Symmetrically penalizes false positives in background (f2 > 0) and false negatives in lesion (f2 < 0)
-        interaction_fp = f1_prob * torch.clamp(f2_lsf, min=0.0)
-        interaction_fn = (1.0 - f1_prob) * torch.clamp(-f2_lsf, min=0.0)
+        # Normalize f2 to [-1, 1] via tanh to stabilize interaction gradients,
+        # since the LSF head can output values in [-5, 5] but the formula assumes unit scale.
+        f2_norm = torch.tanh(f2_lsf)
+        interaction_fp = f1_prob * torch.clamp(f2_norm, min=0.0)
+        interaction_fn = (1.0 - f1_prob) * torch.clamp(-f2_norm, min=0.0)
         l_interact = (interaction_fp + interaction_fn).mean()
 
         # Total L_DTC (Eq. 4)

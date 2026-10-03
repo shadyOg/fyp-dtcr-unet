@@ -38,6 +38,8 @@ coverage.xml
 # Outputs, checkpoints, models
 outputs/
 *.pth
+*.log
+paper_full_text.txt
 
 # Secrets
 .env

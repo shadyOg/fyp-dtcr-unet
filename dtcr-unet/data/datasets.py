@@ -29,6 +29,7 @@ class DualTaskDataset(Dataset):
         transform: bool = True,
         labeled_ratio: float = 1.0,
         seed: int = 42,
+        only_lesion_slices: bool = False,
     ):
         """
         Args:
@@ -37,6 +38,7 @@ class DualTaskDataset(Dataset):
             transform: Whether to apply data augmentation (only if split == 'train').
             labeled_ratio: Fraction of training samples that are labeled (0.0 to 1.0).
             seed: Random seed for selecting labeled vs unlabeled samples.
+            only_lesion_slices: If True, keep only slices with positive ground truth masks (for validation).
         """
         self.data_dir = Path(data_dir) / split
         self.split = split
@@ -45,6 +47,23 @@ class DualTaskDataset(Dataset):
         self.img_paths = sorted(glob(str(self.data_dir / "images" / "*.npy")))
         if len(self.img_paths) == 0:
             raise RuntimeError(f"No .npy images found in {self.data_dir / 'images'}")
+
+        # Filter out empty background slices if requested (e.g. for pure lesion validation)
+        if only_lesion_slices:
+            lesion_paths = []
+            for p in self.img_paths:
+                m_path = self.data_dir / "masks" / Path(p).name
+                if m_path.exists():
+                    try:
+                        mask_arr = np.load(m_path)
+                        if mask_arr.any():
+                            lesion_paths.append(p)
+                    except Exception:
+                        lesion_paths.append(p)
+                else:
+                    lesion_paths.append(p)
+            if lesion_paths:
+                self.img_paths = lesion_paths
 
         # Determine which samples are labeled in semi-supervised training while keeping patient-level integrity
         self.is_labeled_list = [True] * len(self.img_paths)
@@ -228,6 +247,7 @@ def get_dataloaders(
     num_workers: int = 2,
     labeled_ratio: float = 1.0,
     seed: int = 42,
+    filter_empty_val: bool = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Create Train, Val, and Test DataLoaders."""
     train_ds = DualTaskDataset(
@@ -241,11 +261,13 @@ def get_dataloaders(
         data_dir=data_dir,
         split="val",
         transform=False,
+        only_lesion_slices=filter_empty_val,
     )
     test_ds = DualTaskDataset(
         data_dir=data_dir,
         split="test",
         transform=False,
+        only_lesion_slices=False,  # Keep all slices for 3D patient-level reconstruction
     )
 
     if labeled_ratio < 1.0 and batch_size >= 2:

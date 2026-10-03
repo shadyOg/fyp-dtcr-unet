@@ -133,46 +133,75 @@ def evaluate_dataset(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
+    criterion: Optional[torch.nn.Module] = None,
     use_amp: bool = True,
 ) -> dict:
-    """Evaluate model on validation or test set, computing overall and lesion-only slice metrics."""
+    """Evaluate model on validation or test set, computing overall, lesion-only, and validation loss metrics."""
     model.eval()
     all_metrics = []
     lesion_metrics = []
+    val_losses = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Evaluating]", leave=False):
             images = batch["image"].to(device, non_blocking=True)
-            masks = batch["mask"].cpu().numpy()
+            masks = batch["mask"].to(device, non_blocking=True)
+            level_sets = batch["level_set"].to(device, non_blocking=True)
+            is_labeled = batch["is_labeled"].to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
-                f1_logits, _, _ = model(images)
+                f1_logits, f2_lsf, f2_trans = model(images)
+                if criterion is not None:
+                    batch_loss, _ = criterion(
+                        f1_logits=f1_logits,
+                        f2_lsf=f2_lsf,
+                        f2_trans=f2_trans,
+                        target_mask=masks,
+                        target_lsf=level_sets,
+                        is_labeled_mask=is_labeled,
+                        epoch=80,
+                        max_epochs=80,
+                    )
+                    val_losses.append(batch_loss.item())
+
                 probs = torch.sigmoid(f1_logits).float().cpu().numpy()
 
+            masks_np = masks.cpu().numpy()
             for i in range(len(probs)):
-                m = compute_binary_metrics(probs[i, 0], masks[i, 0])
+                m = compute_binary_metrics(probs[i, 0], masks_np[i, 0])
                 all_metrics.append(m)
-                if masks[i, 0].sum() > 0:
+                if masks_np[i, 0].sum() > 0:
                     lesion_metrics.append(m)
 
     mean_metrics = {}
-    for k in all_metrics[0].keys():
-        mean_metrics[k] = float(np.mean([m[k] for m in all_metrics]))
+    if all_metrics:
+        for k in all_metrics[0].keys():
+            mean_metrics[k] = float(np.mean([m[k] for m in all_metrics]))
 
     if lesion_metrics:
         mean_metrics["lesion_dice"] = float(np.mean([m["dice"] for m in lesion_metrics]))
         mean_metrics["lesion_count"] = len(lesion_metrics)
     else:
-        mean_metrics["lesion_dice"] = mean_metrics["dice"]
+        mean_metrics["lesion_dice"] = mean_metrics.get("dice", 0.0)
         mean_metrics["lesion_count"] = 0
+
+    if val_losses:
+        mean_metrics["val_loss"] = float(np.mean(val_losses))
+    else:
+        mean_metrics["val_loss"] = 0.0
 
     return mean_metrics
 
 
-def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
+def train(
+    cfg: DTCRConfig,
+    grad_accum_steps: int = 1,
+    use_amp: bool = True,
+    filter_empty_val: bool = True,
+):
     """Main training execution function."""
     device = torch.device(cfg.device)
-    print(f"Using device: {device} | AMP Mixed Precision: {use_amp}")
+    print(f"Using device: {device} | AMP Mixed Precision: {use_amp} | Filter Empty Val Slices: {filter_empty_val}")
 
     # 1. Prepare DataLoaders
     train_loader, val_loader, test_loader = get_dataloaders(
@@ -181,6 +210,7 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
         num_workers=cfg.num_workers,
         labeled_ratio=cfg.labeled_ratio,
         seed=cfg.seed,
+        filter_empty_val=filter_empty_val,
     )
     print(f"Data ready: {len(train_loader.dataset)} train samples, {len(val_loader.dataset)} val samples.")
 
@@ -225,6 +255,8 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
 
     best_val_dice = 0.0
+    best_lesion_dice = 0.0
+    best_val_loss = float("inf")
     history = []
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -248,14 +280,26 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
             use_amp=use_amp,
         )
 
-        val_metrics = evaluate_dataset(model, val_loader, device, use_amp=use_amp)
+        val_metrics = evaluate_dataset(
+            model=model,
+            loader=val_loader,
+            device=device,
+            criterion=criterion,
+            use_amp=use_amp,
+        )
         scheduler.step()
 
         elapsed = time.time() - t0
         val_dice = val_metrics["dice"]
-        is_best = val_dice > best_val_dice
+        lesion_dice = val_metrics.get("lesion_dice", val_dice)
+        val_loss = val_metrics.get("val_loss", 0.0)
+
+        # Select best model based on lesion_dice so empty background slices don't distort checkpointing
+        is_best = lesion_dice > best_lesion_dice
         if is_best:
+            best_lesion_dice = lesion_dice
             best_val_dice = val_dice
+            best_val_loss = val_loss
 
         epoch_log = {
             "epoch": epoch + 1,
@@ -275,13 +319,14 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
             f"Epoch {epoch + 1:02d}/{cfg.epochs} ({elapsed:.1f}s) | "
             f"LR: {current_lr:.2e} | "
             f"Train Loss: {train_losses['total']:.4f} | "
-            f"Val Dice: {val_dice:.2f}% (Lesion: {val_metrics['lesion_dice']:.2f}%) | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"Val Dice: {val_dice:.2f}% (Lesion: {lesion_dice:.2f}%) | "
             f"Val SE: {val_metrics['sensitivity']:.2f}% | "
             f"Val SP: {val_metrics['specificity']:.2f}% | "
             f"Val Acc: {val_metrics['accuracy']:.2f}% | "
             f"Val F1: {val_metrics['f1']:.2f}% | "
             f"Val HD: {val_metrics['hd']:.2f}px"
-            f"{' | (Best!)' if is_best else ''}"
+            f"{' | (Best Lesion!)' if is_best else ''}"
             f"{skipped_info}"
         )
 
@@ -292,6 +337,8 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_dice": best_val_dice,
+                "best_lesion_dice": best_lesion_dice,
+                "best_val_loss": best_val_loss,
                 "config": vars(cfg),
             },
             is_best=is_best,
@@ -307,17 +354,18 @@ def train(cfg: DTCRConfig, grad_accum_steps: int = 1, use_amp: bool = True):
     with open(os.path.join(cfg.output_dir, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
-    print(f"\nTraining Complete! Best Validation Dice: {best_val_dice:.2f}%")
+    print(f"\nTraining Complete! Best Lesion Dice: {best_lesion_dice:.2f}% (Overall Val Dice: {best_val_dice:.2f}%)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train DTCR-U-Net")
     parser.add_argument("--data", default="data/processed", help="Path to preprocessed dataset")
-    parser.add_argument("--epochs", type=int, default=80, help="Total training epochs")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
-    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate")
-    parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio")
+    parser.add_argument("--epochs", type=int, default=80, help="Total training epochs (default: 80 per paper)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Per-step batch size (default: 8)")
+    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4 -> effective batch 32 per paper)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (default: 0.001 per paper)")
+    parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4)")
+    parser.add_argument("--no-filter-val", action="store_true", help="Include empty background slices in validation")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--outputs", default="outputs", help="Directory to save logs and results")
@@ -333,7 +381,12 @@ def main():
         output_dir=args.outputs,
     )
 
-    train(cfg, grad_accum_steps=args.grad_accum, use_amp=not args.no_amp)
+    train(
+        cfg,
+        grad_accum_steps=args.grad_accum,
+        use_amp=not args.no_amp,
+        filter_empty_val=not args.no_filter_val,
+    )
 
 
 if __name__ == "__main__":

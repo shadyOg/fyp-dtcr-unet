@@ -27,13 +27,17 @@ from .mssc import MultiScaleSkipConnection
 
 def inverse_level_set_transform(
     z: torch.Tensor,
-    k: float = 1.0,
+    k: float = 5.0,
 ) -> torch.Tensor:
     """Differentiable inverse mapping T^{-1}(z) converting Level Set output back to segmentation space.
 
     Per Eq. (2) in the DTCR-U-Net paper:
         T^{-1}(z) = sigma(-k * z)
     Maps z < 0 (inside lesion) -> 1.0, z > 0 (background) -> 0.0.
+
+    k=5.0 is calibrated so that for LSF targets normalized to [-1, 1]:
+        z = -1 -> sigma(5) ≈ 0.993 (lesion)    z = +1 -> sigma(-5) ≈ 0.007 (background)
+    With k=1.0 these were [0.27, 0.73], creating a permanent DTC consistency loss floor.
     """
     z_clamped = torch.clamp(z, min=-10.0, max=10.0)
     return torch.sigmoid(-k * z_clamped)
@@ -83,16 +87,21 @@ class DTCR_UNet(nn.Module):
 
         # ---------------- 3. MsSC Skip Connections & Decoder ----------------
         # Multi-scale skip aggregation across encoder levels
+        # MsSC skip connections: features[0] sets the target resolution,
+        # so we order them to match the decoder level they connect to.
+        # D1 at H/8 <- target from e4(H/8), with context from e3(H/4)
         self.mssc4 = MultiScaleSkipConnection(
-            in_channels_list=[base_c * 4, base_c * 8],
+            in_channels_list=[base_c * 8, base_c * 4],
             out_channels=base_c * 8,
         )
+        # D2 at H/4 <- target from e3(H/4), with context from e2(H/2) and e4(H/8)
         self.mssc3 = MultiScaleSkipConnection(
-            in_channels_list=[base_c * 2, base_c * 4, base_c * 8],
+            in_channels_list=[base_c * 4, base_c * 2, base_c * 8],
             out_channels=base_c * 4,
         )
+        # D3 at H/2 <- target from e2(H/2), with context from e1(H) and e3(H/4)
         self.mssc2 = MultiScaleSkipConnection(
-            in_channels_list=[base_c, base_c * 2, base_c * 4],
+            in_channels_list=[base_c * 2, base_c, base_c * 4],
             out_channels=base_c * 2,
         )
 
@@ -145,14 +154,14 @@ class DTCR_UNet(nn.Module):
 
         bottle_fused = self.bottleneck_fuse(torch.cat([bottle, f_aef], dim=1))
 
-        # 3. Decoder with MsSC Skip Connections
-        skip4 = self.mssc4([e3, e4])
+        # 3. Decoder with MsSC Skip Connections (features[0] = target resolution)
+        skip4 = self.mssc4([e4, e3])        # target H/8 from e4
         d1 = self.up1(bottle_fused, skip4)  # (B, 512, H/8, W/8)
 
-        skip3 = self.mssc3([e2, e3, e4])
+        skip3 = self.mssc3([e3, e2, e4])    # target H/4 from e3
         d2 = self.up2(d1, skip3)            # (B, 256, H/4, W/4)
 
-        skip2 = self.mssc2([e1, e2, e3])
+        skip2 = self.mssc2([e2, e1, e3])    # target H/2 from e2
         d3 = self.up3(d2, skip2)            # (B, 128, H/2, W/2)
 
         d4 = self.up4(d3, e1)               # (B, 64, H, W)
