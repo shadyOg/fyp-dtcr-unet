@@ -24,7 +24,7 @@ def compute_spatial_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
 
 
 class SupervisedLSFLoss(nn.Module):
-    """Supervised Boundary Loss L_LSF for Task 2."""
+    """Supervised Boundary Loss L_LSF for Task 2 matching Eq. 9 of paper."""
 
     def __init__(self, beta: float = 0.5):
         """
@@ -33,7 +33,6 @@ class SupervisedLSFLoss(nn.Module):
         """
         super().__init__()
         self.beta = beta
-        self.smooth_l1 = nn.SmoothL1Loss(beta=0.1)
 
     def forward(self, pred_lsf: torch.Tensor, target_lsf: torch.Tensor) -> torch.Tensor:
         """
@@ -41,13 +40,13 @@ class SupervisedLSFLoss(nn.Module):
             pred_lsf: Predicted Level Set Function map f2(x) of shape (B, 1, H, W).
             target_lsf: Ground truth Level Set map T(y) of shape (B, 1, H, W).
         """
-        # 1. Main LSF loss (Smooth L1 for stability)
-        loss_main = self.smooth_l1(pred_lsf, target_lsf)
+        # 1. Main LSF loss ||f2(x) - T(y)||^2 (Eq. 9)
+        loss_main = F.mse_loss(pred_lsf, target_lsf)
 
         # 2. Gradient constraint ||nabla f2(x) - nabla T(y)||^2
         pred_gx, pred_gy = compute_spatial_gradients(pred_lsf)
         targ_gx, targ_gy = compute_spatial_gradients(target_lsf)
 
-        loss_grad = self.smooth_l1(pred_gx, targ_gx) + self.smooth_l1(pred_gy, targ_gy)
+        loss_grad = F.mse_loss(pred_gx, targ_gx) + F.mse_loss(pred_gy, targ_gy)
 
         return loss_main + self.beta * loss_grad

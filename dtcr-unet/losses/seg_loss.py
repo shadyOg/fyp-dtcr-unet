@@ -51,20 +51,14 @@ class FocalLoss(nn.Module):
 
 
 class SupervisedSegLoss(nn.Module):
-    """Segmentation Loss with balanced BCE/Focal and Dice components to prevent background collapse.
-
-    Uses pos_weight in BCE to compensate for lesion/background class imbalance
-    (~1:100 in lung CT scans). pos_weight=10 means false negatives are penalised 10×
-    more than false positives, forcing the model to detect lesions rather than
-    collapsing to all-background.
-    """
+    """Segmentation Loss combining Binary Cross-Entropy and Dice Loss per Eq. 8 of paper."""
 
     def __init__(
         self,
         bce_weight: float = 1.0,
         dice_weight: float = 1.0,
         smooth: float = 1.0,
-        pos_weight: float = 10.0,
+        pos_weight: float = 1.0,
         use_focal: bool = False,
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
@@ -87,8 +81,11 @@ class SupervisedSegLoss(nn.Module):
         if self.use_focal:
             bce = self.focal_loss(logits, target)
         else:
-            pw = self.pw.to(device=logits.device, dtype=logits.dtype)
-            bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
+            if self.pw.item() != 1.0:
+                pw = self.pw.to(device=logits.device, dtype=logits.dtype)
+                bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
+            else:
+                bce = F.binary_cross_entropy_with_logits(logits, target)
 
         probs = torch.sigmoid(logits)
         dice = self.dice_loss(probs, target)

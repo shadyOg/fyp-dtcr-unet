@@ -27,6 +27,8 @@ def evaluate_checkpoint(
     batch_size: int = 16,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     save_visualizations: int = 10,
+    threshold: float = 0.5,
+    fuse_dual_task: bool = False,
 ):
     """Load model checkpoint and run comprehensive test set evaluation."""
     dev = torch.device(device)
@@ -35,6 +37,7 @@ def evaluate_checkpoint(
     os.makedirs(comparisons_dir, exist_ok=True)
 
     print(f"Loading checkpoint from: {checkpoint_path}")
+    print(f"Evaluation settings: Threshold={threshold} | Dual-Task Fusion={fuse_dual_task}")
     checkpoint = torch.load(checkpoint_path, map_location=dev)
 
     # Initialize model
@@ -57,12 +60,17 @@ def evaluate_checkpoint(
             patient_ids = batch.get("patient_id", [f"unknown_{batch_idx}_{i}" for i in range(len(images))])
 
             f1_logits, f2_lsf, f2_trans = model(images)
-            probs = torch.sigmoid(f1_logits).cpu().numpy()
+            f1_probs = torch.sigmoid(f1_logits).cpu().numpy()
             trans_probs = f2_trans.cpu().numpy()
             images_np = images.cpu().numpy()
 
+            if fuse_dual_task:
+                probs = 0.5 * f1_probs + 0.5 * trans_probs
+            else:
+                probs = f1_probs
+
             for i in range(len(probs)):
-                m = compute_binary_metrics(probs[i, 0], masks[i, 0])
+                m = compute_binary_metrics(probs[i, 0], masks[i, 0], threshold=threshold)
                 metrics_list.append(m)
 
                 if masks[i, 0].sum() > 0:
@@ -122,7 +130,7 @@ def evaluate_checkpoint(
     patient_metrics = []
     eps = 1e-8
     for pid, pairs in patient_slices.items():
-        p_vol = np.stack([p[0] for p in pairs], axis=0) > 0.5
+        p_vol = np.stack([p[0] for p in pairs], axis=0) > threshold
         t_vol = np.stack([p[1] for p in pairs], axis=0) > 0.5
 
         tp = float(np.logical_and(p_vol, t_vol).sum())
@@ -200,6 +208,8 @@ def main():
     parser.add_argument("--data", default="data/processed", help="Path to preprocessed dataset")
     parser.add_argument("--out", default="outputs/evaluation", help="Output directory for results")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold (default: 0.5)")
+    parser.add_argument("--fuse-dual-task", action="store_true", help="Ensemble Task 1 (Dice head) and Task 2 (Level Set inverse mapping)")
     parser.add_argument("--save-vis", type=int, default=20, help="Number of qualitative comparisons to save (0 to disable)")
     args = parser.parse_args()
 
@@ -209,6 +219,8 @@ def main():
         output_dir=args.out,
         batch_size=args.batch_size,
         save_visualizations=args.save_vis,
+        threshold=args.threshold,
+        fuse_dual_task=args.fuse_dual_task,
     )
 
 
