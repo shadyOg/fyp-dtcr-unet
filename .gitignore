@@ -44,3 +44,8 @@ paper_full_text.txt
 # Secrets
 .env
 credentials.json
+
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
