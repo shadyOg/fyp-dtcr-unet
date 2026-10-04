@@ -44,40 +44,43 @@ class CTInferenceEngine:
 
     def __init__(self, checkpoint_path: Optional[str] = None, device: Optional[str] = None):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.model = DTCR_UNet(in_channels=1, n_classes=1, base_c=32)
+        self.model = DTCR_UNet(in_channels=1, n_classes=1, base_c=64)
         self.checkpoint_path = checkpoint_path
         self.is_loaded = False
         self._load_model()
 
     def _load_model(self):
         """Loads weights from checkpoint or initializes with realistic weights."""
-        if self.checkpoint_path and os.path.exists(self.checkpoint_path):
+        default_paths = [
+            self.checkpoint_path,
+            os.path.join(DTCR_ROOT, "checkpoints", "best_model.pth"),
+            os.path.join(PROJECT_ROOT, "checkpoints", "best_model.pth"),
+            os.path.join(DTCR_ROOT, "checkpoints", "latest_model.pth"),
+        ]
+        target_path = next((p for p in default_paths if p and os.path.exists(p)), None)
+
+        if target_path:
             try:
-                ckpt = torch.load(self.checkpoint_path, map_location=self.device)
-                state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-                self.model.load_state_dict(state_dict, strict=False)
-                print(f"[DTCR-U-Net] Loaded checkpoint from: {self.checkpoint_path}")
+                ckpt = torch.load(target_path, map_location=self.device)
+                state_dict = ckpt.get("model_state_dict", ckpt.get("model_state", ckpt.get("state_dict", ckpt)))
+                
+                # Check base_c from config if present
+                cfg = ckpt.get("config", {})
+                base_c = cfg.get("base_c", 64) if isinstance(cfg, dict) else 64
+                self.model = DTCR_UNet(in_channels=1, n_classes=1, base_c=base_c)
+                
+                self.model.load_state_dict(state_dict, strict=True)
+                print(f"[DTCR-U-Net] Successfully loaded trained weights from: {target_path}")
                 self.is_loaded = True
             except Exception as e:
-                print(f"[DTCR-U-Net] Failed to load checkpoint ({e}). Running in evaluation mode.")
-        else:
-            # Check default locations
-            default_paths = [
-                os.path.join(DTCR_ROOT, "checkpoints", "best_model.pth"),
-                os.path.join(DTCR_ROOT, "checkpoints", "latest_model.pth"),
-                os.path.join(PROJECT_ROOT, "checkpoints", "best_model.pth")
-            ]
-            for p in default_paths:
-                if os.path.exists(p):
-                    try:
-                        ckpt = torch.load(p, map_location=self.device)
-                        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-                        self.model.load_state_dict(state_dict, strict=False)
-                        print(f"[DTCR-U-Net] Loaded default checkpoint: {p}")
-                        self.is_loaded = True
-                        break
-                    except Exception as e:
-                        print(f"[DTCR-U-Net] Error loading default checkpoint ({e})")
+                print(f"[DTCR-U-Net] Strict load failed ({e}), trying fallback...")
+                try:
+                    self.model.load_state_dict(state_dict, strict=False)
+                    self.is_loaded = True
+                    print(f"[DTCR-U-Net] Loaded weights with strict=False from {target_path}")
+                except Exception as e2:
+                    print(f"[DTCR-U-Net] Checkpoint load failed ({e2}).")
+
         
         self.model.to(self.device)
         self.model.eval()
