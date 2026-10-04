@@ -98,28 +98,25 @@ class DualTaskDataset(Dataset):
         self, img: np.ndarray, mask: np.ndarray, lsf: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Apply synchronized geometric and intensity data augmentations."""
-        # Random horizontal flip
+        # 1. Random horizontal flip (anatomically valid left/right lung symmetry)
         if random.random() > 0.5:
             img = np.fliplr(img).copy()
             mask = np.fliplr(mask).copy()
             lsf = np.fliplr(lsf).copy()
 
-        # Random vertical flip
+        # 2. Small random affine rotation (+/- 10 degrees) preserving upright chest geometry
         if random.random() > 0.5:
-            img = np.flipud(img).copy()
-            mask = np.flipud(mask).copy()
-            lsf = np.flipud(lsf).copy()
+            angle = random.uniform(-10.0, 10.0)
+            h, w = img.shape
+            center = (w / 2.0, h / 2.0)
+            rot_mat = cv2.getRotationMatrix2D(center, angle, scale=1.0)
+            img = cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+            mask = cv2.warpAffine(mask, rot_mat, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+            lsf = cv2.warpAffine(lsf, rot_mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=1.0)
 
-        # Random 90-degree rotations
-        k = random.randint(0, 3)
-        if k > 0:
-            img = np.rot90(img, k).copy()
-            mask = np.rot90(mask, k).copy()
-            lsf = np.rot90(lsf, k).copy()
-
-        # Random scale and crop / pad (zoom 0.85x to 1.15x)
+        # 3. Random scale and crop / pad (zoom 0.9x to 1.1x)
         if random.random() > 0.5:
-            scale = random.uniform(0.85, 1.15)
+            scale = random.uniform(0.90, 1.10)
             h, w = img.shape
             new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
             img_s = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
@@ -137,7 +134,7 @@ class DualTaskDataset(Dataset):
                 pw = (w - new_w) // 2
                 img = np.pad(img_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="constant", constant_values=0)
                 mask = np.pad(mask_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="constant", constant_values=0)
-                lsf = np.pad(lsf_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="edge")
+                lsf = np.pad(lsf_s, ((ph, h - new_h - ph), (pw, w - new_w - pw)), mode="constant", constant_values=1.0)
 
         # Subtle intensity jitter (gamma)
         if random.random() > 0.5:

@@ -56,7 +56,7 @@ class SupervisedSegLoss(nn.Module):
     def __init__(
         self,
         bce_weight: float = 1.0,
-        dice_weight: float = 1.0,
+        dice_weight: float = 2.0,
         smooth: float = 1.0,
         pos_weight: float = 1.0,
         use_focal: bool = False,
