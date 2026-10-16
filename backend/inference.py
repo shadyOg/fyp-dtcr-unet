@@ -69,17 +69,17 @@ class CTInferenceEngine:
                 base_c = cfg.get("base_c", 64) if isinstance(cfg, dict) else 64
                 self.model = DTCR_UNet(in_channels=1, n_classes=1, base_c=base_c)
                 
-                self.model.load_state_dict(state_dict, strict=True)
-                print(f"[DTCR-U-Net] Successfully loaded trained weights from: {target_path}")
-                self.is_loaded = True
-            except Exception as e:
-                print(f"[DTCR-U-Net] Strict load failed ({e}), trying fallback...")
                 try:
+                    self.model.load_state_dict(state_dict, strict=True)
+                    print(f"[DTCR-U-Net] Successfully loaded trained weights from: {target_path}")
+                    self.is_loaded = True
+                except Exception as strict_err:
+                    print(f"[DTCR-U-Net] Strict load failed ({strict_err}), trying fallback...")
                     self.model.load_state_dict(state_dict, strict=False)
                     self.is_loaded = True
                     print(f"[DTCR-U-Net] Loaded weights with strict=False from {target_path}")
-                except Exception as e2:
-                    print(f"[DTCR-U-Net] Checkpoint load failed ({e2}).")
+            except Exception as e:
+                print(f"[DTCR-U-Net] Checkpoint load failed ({e}).")
 
         
         self.model.to(self.device)
@@ -163,6 +163,27 @@ class CTInferenceEngine:
             metadata["format"] = "standard_image"
             return vol.astype(np.float32), metadata
 
+    def preview_scan(self, file_bytes: bytes, filename: str) -> Dict:
+        """Preprocesses any CT scan file (.npy, .dcm, .nii, .png, etc.) and generates raw slice images without running inference."""
+        vol, meta = self.preprocess_image_bytes(file_bytes, filename)
+        num_slices = vol.shape[0]
+
+        slices_data = []
+        for s_idx in range(num_slices):
+            raw_slice = vol[s_idx]
+            raw_base64 = self._numpy_to_base64(raw_slice, colormap="gray")
+            slices_data.append({
+                "slice_index": s_idx,
+                "raw_image": raw_base64,
+            })
+
+        return {
+            "metadata": meta,
+            "total_slices": num_slices,
+            "is_preview": True,
+            "slices": slices_data,
+        }
+
     @torch.no_grad()
     def analyze_scan(
         self,
@@ -227,6 +248,7 @@ class CTInferenceEngine:
             raw_base64 = self._numpy_to_base64(raw_slice, colormap="gray")
             overlay_base64 = self._create_overlay_base64(raw_slice, binary_mask, prob_map)
             contour_base64 = self._create_contour_base64(raw_slice, lsf_map)
+            mask_base64 = self._numpy_to_base64(binary_mask)
 
             slice_lung_pct = (lesion_pixels / max(lung_pixels, 1)) * 100.0 if lung_pixels > 0 else 0.0
 
@@ -239,6 +261,7 @@ class CTInferenceEngine:
                 "raw_image": raw_base64,
                 "overlay_image": overlay_base64,
                 "contour_image": contour_base64,
+                "pred_mask_image": mask_base64,
             })
 
         # Overall Volumetry Calculation
@@ -284,6 +307,111 @@ class CTInferenceEngine:
             "slices": slices_data,
         }
 
+    def compare_ground_truth(
+        self,
+        mask_bytes: bytes,
+        filename: str,
+        analysis_data: Dict
+    ) -> Dict:
+        """Processes an uploaded ground truth mask and calculates pixel-level overlap & comparison overlays."""
+        gt_vol, gt_meta = self.preprocess_image_bytes(mask_bytes, filename)
+        slices = analysis_data.get("slices", [])
+        num_slices = len(slices)
+
+        total_tp, total_fp, total_fn, total_tn = 0, 0, 0, 0
+        updated_slices = []
+
+        for s_idx in range(num_slices):
+            slice_info = dict(slices[s_idx])
+            
+            # Extract corresponding ground truth slice
+            if s_idx < len(gt_vol):
+                gt_slice_raw = gt_vol[s_idx]
+            else:
+                gt_slice_raw = gt_vol[-1]
+
+            # Decode raw CT slice from base64
+            raw_b64 = slice_info.get("raw_image", "")
+            if raw_b64 and "base64," in raw_b64:
+                raw_bytes = base64.b64decode(raw_b64.split("base64,")[1])
+                raw_pil = Image.open(io.BytesIO(raw_bytes)).convert("L")
+                raw_arr = np.array(raw_pil, dtype=np.float32) / 255.0
+            else:
+                raw_arr = np.zeros((256, 256), dtype=np.float32)
+
+            h, w = raw_arr.shape
+
+            # Resize ground truth to match CT scan resolution
+            gt_resized = cv2.resize(gt_slice_raw, (w, h), interpolation=cv2.INTER_NEAREST)
+            gt_binary = (gt_resized > 0.5).astype(np.uint8)
+
+            # Decode predicted mask from slice_info
+            pred_b64 = slice_info.get("pred_mask_image", "")
+            if pred_b64 and "base64," in pred_b64:
+                pred_bytes = base64.b64decode(pred_b64.split("base64,")[1])
+                pred_pil = Image.open(io.BytesIO(pred_bytes)).convert("L")
+                pred_binary = (np.array(pred_pil) > 127).astype(np.uint8)
+            else:
+                pred_binary = np.zeros((h, w), dtype=np.uint8)
+
+            # Compute pixel metrics for slice
+            tp = int(np.sum((pred_binary == 1) & (gt_binary == 1)))
+            fp = int(np.sum((pred_binary == 1) & (gt_binary == 0)))
+            fn = int(np.sum((pred_binary == 0) & (gt_binary == 1)))
+            tn = int(np.sum((pred_binary == 0) & (gt_binary == 0)))
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_tn += tn
+
+            denom = (2.0 * tp + fp + fn)
+            slice_dice = (2.0 * tp / denom * 100.0) if denom > 0 else (100.0 if (tp + fp + fn) == 0 else 0.0)
+            iou_denom = (tp + fp + fn)
+            slice_iou = (tp / iou_denom * 100.0) if iou_denom > 0 else 100.0
+
+            # Generate Ground Truth Overlay in Emerald Green (#17BF28)
+            gt_overlay_b64 = self._create_single_overlay_base64(raw_arr, gt_binary, color=[23, 191, 40])
+
+            # Generate Composite Comparison Overlay:
+            # - Green [23, 191, 40]: Ground Truth only (FN / missed)
+            # - Red [229, 35, 35]: AI Prediction only (FP)
+            # - Amber Gold [236, 148, 44]: Both agree (TP / overlap)
+            composite_b64 = self._create_comparison_composite_base64(raw_arr, pred_binary, gt_binary)
+
+            slice_info["gt_overlay_image"] = gt_overlay_b64
+            slice_info["composite_image"] = composite_b64
+            slice_info["slice_dice"] = round(slice_dice, 1)
+            slice_info["slice_iou"] = round(slice_iou, 1)
+            slice_info["gt_pixels"] = int(np.sum(gt_binary))
+            slice_info["has_ground_truth"] = True
+
+            updated_slices.append(slice_info)
+
+        # Global metrics across all slices
+        global_denom = (2.0 * total_tp + total_fp + total_fn)
+        overall_dice = (2.0 * total_tp / global_denom * 100.0) if global_denom > 0 else 100.0
+        
+        iou_denom = (total_tp + total_fp + total_fn)
+        overall_iou = (total_tp / iou_denom * 100.0) if iou_denom > 0 else 100.0
+
+        sens_denom = (total_tp + total_fn)
+        overall_sensitivity = (total_tp / sens_denom * 100.0) if sens_denom > 0 else 100.0
+
+        spec_denom = (total_tn + total_fp)
+        overall_specificity = (total_tn / spec_denom * 100.0) if spec_denom > 0 else 100.0
+
+        return {
+            **analysis_data,
+            "has_ground_truth": True,
+            "ground_truth_filename": filename,
+            "overall_dice": round(overall_dice, 2),
+            "overall_iou": round(overall_iou, 2),
+            "overall_sensitivity": round(overall_sensitivity, 2),
+            "overall_specificity": round(overall_specificity, 2),
+            "slices": updated_slices,
+        }
+
     def _numpy_to_base64(self, arr: np.ndarray, colormap: str = "gray") -> str:
         """Encodes a [0, 1] 2D numpy array to a base64 PNG data URL."""
         norm_255 = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
@@ -303,7 +431,6 @@ class CTInferenceEngine:
         mask_bool = binary_mask > 0
 
         if np.any(mask_bool):
-            # Alpha blend lesion regions: 65% coral red + 35% background CT
             red_fill = np.array([229, 35, 35], dtype=np.float32)
             alpha = 0.65
             for c in range(3):
@@ -311,7 +438,6 @@ class CTInferenceEngine:
                     (1.0 - alpha) * raw_rgb[mask_bool, c] + alpha * red_fill[c], 0, 255
                 ).astype(np.uint8)
 
-            # Draw outer perimeter contour
             contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(overlay_rgb, contours, -1, (255, 100, 100), thickness=2)
 
@@ -320,11 +446,68 @@ class CTInferenceEngine:
         img.save(buf, format="PNG")
         return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
 
+    def _create_single_overlay_base64(self, raw_slice: np.ndarray, binary_mask: np.ndarray, color: List[int]) -> str:
+        """Renders raw slice with a specified color mask (e.g. Green for ground truth)."""
+        h, w = raw_slice.shape
+        raw_rgb = np.repeat((np.clip(raw_slice * 255.0, 0, 255).astype(np.uint8))[:, :, np.newaxis], 3, axis=2)
+        overlay_rgb = raw_rgb.copy()
+        mask_bool = binary_mask > 0
+
+        if np.any(mask_bool):
+            fill_color = np.array(color, dtype=np.float32)
+            alpha = 0.65
+            for c in range(3):
+                overlay_rgb[mask_bool, c] = np.clip(
+                    (1.0 - alpha) * raw_rgb[mask_bool, c] + alpha * fill_color[c], 0, 255
+                ).astype(np.uint8)
+
+            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay_rgb, contours, -1, (min(color[0] + 40, 255), min(color[1] + 40, 255), min(color[2] + 40, 255)), thickness=2)
+
+        img = Image.fromarray(overlay_rgb, mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+    def _create_comparison_composite_base64(self, raw_slice: np.ndarray, pred_mask: np.ndarray, gt_mask: np.ndarray) -> str:
+        """Renders a composite comparison overlay with Green (GT only), Red (AI only), Yellow (Agreement)."""
+        h, w = raw_slice.shape
+        raw_rgb = np.repeat((np.clip(raw_slice * 255.0, 0, 255).astype(np.uint8))[:, :, np.newaxis], 3, axis=2)
+        composite_rgb = raw_rgb.copy()
+
+        tp_mask = (pred_mask == 1) & (gt_mask == 1)
+        fp_mask = (pred_mask == 1) & (gt_mask == 0)
+        fn_mask = (pred_mask == 0) & (gt_mask == 1)
+
+        alpha = 0.70
+
+        # 1. True Positives (Overlap / Agreement): Warm Gold/Yellow [236, 148, 44]
+        if np.any(tp_mask):
+            tp_color = np.array([236, 148, 44], dtype=np.float32)
+            for c in range(3):
+                composite_rgb[tp_mask, c] = np.clip((1.0 - alpha) * raw_rgb[tp_mask, c] + alpha * tp_color[c], 0, 255).astype(np.uint8)
+
+        # 2. False Positives (AI Only): Coral Red [229, 35, 35]
+        if np.any(fp_mask):
+            fp_color = np.array([229, 35, 35], dtype=np.float32)
+            for c in range(3):
+                composite_rgb[fp_mask, c] = np.clip((1.0 - alpha) * raw_rgb[fp_mask, c] + alpha * fp_color[c], 0, 255).astype(np.uint8)
+
+        # 3. False Negatives (Ground Truth Only): Emerald Green [23, 191, 40]
+        if np.any(fn_mask):
+            fn_color = np.array([23, 191, 40], dtype=np.float32)
+            for c in range(3):
+                composite_rgb[fn_mask, c] = np.clip((1.0 - alpha) * raw_rgb[fn_mask, c] + alpha * fn_color[c], 0, 255).astype(np.uint8)
+
+        img = Image.fromarray(composite_rgb, mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
     def _create_contour_base64(self, raw_slice: np.ndarray, lsf_map: np.ndarray) -> str:
         """Renders Level Set zero-level boundary curve in Cyan/Sky accent #25B4F8."""
         raw_rgb = np.repeat((np.clip(raw_slice * 255.0, 0, 255).astype(np.uint8))[:, :, np.newaxis], 3, axis=2)
         
-        # Zero level set contour
         lsf_binary = (lsf_map <= 0.0).astype(np.uint8)
         contours, _ = cv2.findContours(lsf_binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
@@ -334,3 +517,4 @@ class CTInferenceEngine:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+

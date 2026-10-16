@@ -42,8 +42,8 @@ app.add_middleware(
 engine = CTInferenceEngine()
 
 
-@app.get("/")
-def root():
+@app.get("/api/status")
+def status():
     return {
         "status": "online",
         "service": "DTCR-U-Net Clinical Segmentation API",
@@ -59,6 +59,32 @@ def health_check():
         "device": str(engine.device),
         "model_loaded": engine.is_loaded
     }
+
+
+@app.post("/api/preview")
+async def preview_scan(
+    file: UploadFile = File(...)
+):
+    """Receives uploaded CT file (.npy, .dcm, .nii, .png, etc.) and parses slices for immediate inspection without running inference."""
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        filename = file.filename or "scan.npy"
+        results = engine.preview_scan(
+            file_bytes=file_bytes,
+            filename=filename
+        )
+        return JSONResponse(content={"success": True, "data": results})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"Failed to preview scan: {str(e)}"}
+        )
 
 
 @app.post("/api/analyze")
@@ -91,6 +117,37 @@ async def analyze_scan(
         )
 
 
+@app.post("/api/compare-ground-truth")
+async def compare_ground_truth(
+    mask_file: UploadFile = File(...),
+    analysis_json: str = Form(...)
+):
+    """Receives uploaded Ground Truth mask (e.g. .npy, .png, .dcm, .nii) and computes visual comparison & Dice metrics."""
+    try:
+        import json
+        mask_bytes = await mask_file.read()
+        if not mask_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded mask file is empty.")
+
+        analysis_data = json.loads(analysis_json)
+        filename = mask_file.filename or "mask.npy"
+
+        comparison_results = engine.compare_ground_truth(
+            mask_bytes=mask_bytes,
+            filename=filename,
+            analysis_data=analysis_data
+        )
+        return JSONResponse(content={"success": True, "data": comparison_results})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"Failed to compare mask: {str(e)}"}
+        )
+
+
 @app.post("/api/export-report")
 async def export_report(payload: Dict):
     """Generates a downloadable clinical PDF diagnostic report from analysis findings."""
@@ -119,6 +176,39 @@ async def export_report(payload: Dict):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Serve React Frontend SPA (Unified Service)
+# ---------------------------------------------------------------------------
+FRONTEND_DIST = os.path.join(PROJECT_ROOT, "frontend", "dist")
+if not os.path.isdir(FRONTEND_DIST):
+    FRONTEND_DIST = os.path.join(os.getcwd(), "frontend", "dist")
+
+if os.path.isdir(FRONTEND_DIST):
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    assets_dir = os.path.join(FRONTEND_DIST, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/")
+    async def serve_index():
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+
+    @app.get("/index.html")
+    async def serve_index_html():
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+else:
+    @app.get("/")
+    def fallback_root():
+        return {
+            "status": "online",
+            "service": "DTCR-U-Net Clinical Segmentation API (Frontend build not found)",
+            "device": str(engine.device),
+            "model_loaded": engine.is_loaded
+        }
 
 
 if __name__ == "__main__":

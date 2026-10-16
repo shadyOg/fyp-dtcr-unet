@@ -1,7 +1,7 @@
 import React from 'react';
-import { ShieldCheck, AlertTriangle, AlertCircle, FileText, Activity, Stethoscope } from 'lucide-react';
+import { ShieldCheck, AlertTriangle, AlertCircle, FileText, Activity, Stethoscope, CheckCircle2 } from 'lucide-react';
 
-export default function ClinicalCard({ analysisData, onOpenReportModal }) {
+export default function ClinicalCard({ analysisData, onOpenReportModal, onAnalyze, isAnalyzing }) {
   if (!analysisData) {
     return (
       <div className="clinical-card" style={{ opacity: 0.6, textAlign: 'center', padding: '3rem 1.5rem' }}>
@@ -10,7 +10,62 @@ export default function ClinicalCard({ analysisData, onOpenReportModal }) {
           Awaiting CT Scan
         </div>
         <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)', marginTop: '0.35rem' }}>
-          Upload a 2D or 3D scan on the left and click "Analyze Scan" to generate the diagnostic assessment.
+          Upload any 2D or 3D scan on the left (.npy, .dcm, .nii, .png) to inspect the image and run AI analysis.
+        </div>
+      </div>
+    );
+  }
+
+  if (analysisData.is_preview) {
+    return (
+      <div className="clinical-card">
+        <div className="card-heading">
+          <div className="card-title">Scan Loaded for Inspection</div>
+        </div>
+
+        <div style={{
+          background: 'rgba(37, 180, 248, 0.08)',
+          border: '1px solid rgba(37, 180, 248, 0.25)',
+          borderRadius: 'var(--radius-module)',
+          padding: '1.25rem',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.75rem',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--color-accent-sky)', fontWeight: 600 }}>
+            <Activity size={18} />
+            <span>Ready for Analysis</span>
+          </div>
+          <div style={{ fontSize: '0.85rem', color: 'var(--color-text-main)' }}>
+            This scan is currently in <strong>Preview Mode</strong>. You can inspect all slices and adjust zoom on the viewer.
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem', fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+            <span>Format: {analysisData.metadata?.format?.toUpperCase() || 'CT'}</span>
+            <span>•</span>
+            <span>Total Slices: {analysisData.total_slices}</span>
+          </div>
+        </div>
+
+        <div className="export-section" style={{ marginTop: 'auto' }}>
+          <button
+            type="button"
+            className="btn-primary"
+            style={{ width: '100%', justifyContent: 'center', padding: '0.85rem' }}
+            onClick={onAnalyze}
+            disabled={isAnalyzing}
+          >
+            {isAnalyzing ? (
+              <>
+                <div className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} />
+                <span>Running DTCR-U-Net...</span>
+              </>
+            ) : (
+              <>
+                <Activity size={18} />
+                <span>Run AI Lesion Analysis</span>
+              </>
+            )}
+          </button>
         </div>
       </div>
     );
@@ -24,6 +79,12 @@ export default function ClinicalCard({ analysisData, onOpenReportModal }) {
     total_lung_volume_cm3,
     clinical_finding,
     action_recommendation,
+    has_ground_truth,
+    overall_dice,
+    overall_iou,
+    overall_sensitivity,
+    overall_specificity,
+    ground_truth_filename,
   } = analysisData;
 
   const renderSeverityIcon = () => {
@@ -56,6 +117,40 @@ export default function ClinicalCard({ analysisData, onOpenReportModal }) {
           <p>{overall_involvement_pct}% Total Lung Involvement</p>
         </div>
       </div>
+
+      {/* Ground Truth Validation Box (If uploaded) */}
+      {has_ground_truth && (
+        <div style={{
+          background: 'rgba(23, 191, 40, 0.08)',
+          border: '1px solid rgba(23, 191, 40, 0.3)',
+          borderRadius: 'var(--radius-module)',
+          padding: '0.85rem 1rem',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.5rem',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: 'var(--color-status-clear)', fontWeight: 600, fontSize: '0.85rem' }}>
+              <CheckCircle2 size={16} />
+              <span>Ground Truth Validation</span>
+            </div>
+            <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+              {ground_truth_filename}
+            </span>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+            <div style={{ background: 'rgba(0,0,0,0.2)', padding: '0.4rem 0.6rem', borderRadius: 'var(--radius-chip)' }}>
+              <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>DICE AGREEMENT</div>
+              <div style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--color-status-clear)' }}>{overall_dice}%</div>
+            </div>
+            <div style={{ background: 'rgba(0,0,0,0.2)', padding: '0.4rem 0.6rem', borderRadius: 'var(--radius-chip)' }}>
+              <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>IoU OVERLAP</div>
+              <div style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--color-action-blue)' }}>{overall_iou}%</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Quantitative Volumetry Metrics Grid */}
       <div className="metrics-grid">

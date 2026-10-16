@@ -9,6 +9,7 @@ export default function App() {
   const [patientId, setPatientId] = useState('PT-2026-8819');
   const [selectedFile, setSelectedFile] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isComparingGt, setIsComparingGt] = useState(false);
   const [analysisData, setAnalysisData] = useState(null);
   const [error, setError] = useState(null);
   const [isServerReady, setIsServerReady] = useState(false);
@@ -34,10 +35,27 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const handleFileSelected = (file) => {
+  const handleFileSelected = async (file) => {
     setSelectedFile(file);
     setError(null);
     setAnalysisData(null);
+
+    if (!file) return;
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/preview', {
+        method: 'POST',
+        body: formData,
+      });
+      const json = await res.json();
+      if (res.ok && json.success) {
+        setAnalysisData(json.data);
+      }
+    } catch (err) {
+      console.error('Preview load error:', err);
+    }
   };
 
   const handleAnalyze = async () => {
@@ -72,6 +90,37 @@ export default function App() {
     }
   };
 
+  const handleUploadGroundTruth = async (maskFile) => {
+    if (!maskFile || !analysisData) return;
+
+    try {
+      setIsComparingGt(true);
+      setError(null);
+
+      const formData = new FormData();
+      formData.append('mask_file', maskFile);
+      formData.append('analysis_json', JSON.stringify(analysisData));
+
+      const response = await fetch('/api/compare-ground-truth', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const json = await response.json();
+
+      if (!response.ok || !json.success) {
+        throw new Error(json.error || `Failed to compare mask with status ${response.status}`);
+      }
+
+      setAnalysisData(json.data);
+    } catch (err) {
+      console.error('Ground truth comparison error:', err);
+      setError(err.message || 'Failed to compare ground truth mask. Please verify mask format.');
+    } finally {
+      setIsComparingGt(false);
+    }
+  };
+
   return (
     <div className="app-container">
       {/* Header Bar */}
@@ -94,7 +143,13 @@ export default function App() {
           />
 
           {analysisData && (
-            <RadiologyViewer analysisData={analysisData} />
+            <RadiologyViewer
+              analysisData={analysisData}
+              onUploadGroundTruth={handleUploadGroundTruth}
+              isComparingGt={isComparingGt}
+              onAnalyze={handleAnalyze}
+              isAnalyzing={isAnalyzing}
+            />
           )}
         </div>
 
@@ -103,6 +158,8 @@ export default function App() {
           <ClinicalCard
             analysisData={analysisData}
             onOpenReportModal={() => setIsReportModalOpen(true)}
+            onAnalyze={handleAnalyze}
+            isAnalyzing={isAnalyzing}
           />
         </aside>
       </main>
