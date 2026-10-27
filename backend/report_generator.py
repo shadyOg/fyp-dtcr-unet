@@ -123,7 +123,17 @@ class ClinicalDiagnosticReport:
         pdf.set_font("Helvetica", "B", 11)
         pdf.set_text_color(1, 22, 50)
         pdf.set_xy(12, 104)
-        pdf.cell(0, 6, "Quantitative Volumetry Findings", ln=True)
+        pdf.cell(100, 6, "Quantitative Volumetry Findings")
+
+        if self.data.get("has_ground_truth"):
+            acc = self.data.get("ai_accuracy", self.data.get("overall_dice", 0.0))
+            tier = self.data.get("accuracy_tier", "Verified")
+            pdf.set_font("Helvetica", "B", 8.5)
+            pdf.set_text_color(23, 140, 40)
+            pdf.set_xy(112, 104)
+            pdf.cell(86, 6, f"AI Accuracy: {acc}% ({tier})", ln=True, align="R")
+        else:
+            pdf.ln(6)
 
         pdf.set_draw_color(220, 224, 230)
         pdf.set_fill_color(255, 255, 255)

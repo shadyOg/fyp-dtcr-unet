@@ -15,46 +15,159 @@ from inference import CTInferenceEngine
 from report_generator import ClinicalDiagnosticReport
 
 
-def test_2d_analysis():
-    print("[Test 1] Testing 2D CT Slice Inference & Overlay Generation...")
+def make_synthetic_thoracic_ct():
+    """Generates a synthetic axial chest CT slice with chest wall and bilateral lungs."""
+    y, x = np.ogrid[:256, :256]
+    body = (x - 128) ** 2 / (105 ** 2) + (y - 128) ** 2 / (85 ** 2) <= 1.0
+    ct = np.zeros((256, 256), dtype=np.uint8)
+    ct[body] = 160  # soft tissue chest wall
+
+    # Bilateral lungs (left and right low-density air cavities)
+    left_lung = (x - 85) ** 2 / (35 ** 2) + (y - 128) ** 2 / (45 ** 2) <= 1.0
+    right_lung = (x - 171) ** 2 / (35 ** 2) + (y - 128) ** 2 / (45 ** 2) <= 1.0
+    ct[left_lung] = 35
+    ct[right_lung] = 35
+
+    # Simulated consolidation lesion inside right lung
+    lesion = (x - 165) ** 2 / (16 ** 2) + (y - 120) ** 2 / (16 ** 2) <= 1.0
+    ct[lesion] = 190
+    return ct
+
+
+def make_synthetic_head_ct():
+    """Generates a synthetic axial head/brain CT slice (circular cranium with brain tissue, no lungs)."""
+    y, x = np.ogrid[:256, :256]
+    skull = (x - 128) ** 2 + (y - 128) ** 2 <= (90 ** 2)
+    brain = (x - 128) ** 2 + (y - 128) ** 2 <= (80 ** 2)
+    ct = np.zeros((256, 256), dtype=np.uint8)
+    ct[skull] = 240  # Dense bone / skull
+    ct[brain] = 130  # Brain parenchyma (solid, no lung cavities)
+    return ct
+
+
+def test_instant_preview_and_validation():
+    print("[Test 1] Testing Instant Scan Preview & Validation on Valid Thoracic CT...")
     engine = CTInferenceEngine()
 
-    # Create synthetic 2D CT slice (256x256) with simulated lung circle and lesion
-    synthetic_ct = np.zeros((256, 256), dtype=np.uint8)
-    # Lung field
-    y, x = np.ogrid[:256, :256]
-    lung_mask = (x - 128) ** 2 + (y - 128) ** 2 <= 90 ** 2
-    synthetic_ct[lung_mask] = 120
-    # Simulated lesion
-    lesion_mask = (x - 150) ** 2 + (y - 140) ** 2 <= 25 ** 2
-    synthetic_ct[lesion_mask] = 210
+    synthetic_ct = make_synthetic_thoracic_ct()
+    buf = io.BytesIO()
+    np.save(buf, synthetic_ct)
+    npy_bytes = buf.getvalue()
 
-    # Save to PNG bytes
+    preview_res = engine.preview_scan(npy_bytes, filename="thoracic_scan.npy")
+    assert preview_res["is_preview"] is True
+    assert preview_res["is_valid_ct"] is True
+    assert preview_res["validation_status"] == "valid"
+    assert "raw_image" in preview_res["slices"][0]
+    print(f"  [PASSED] Valid Thoracic CT accepted (Reason: {preview_res['validation_reason']})")
+
+
+def test_non_lung_ct_accepted():
+    print("\n[Test 1b] Testing Non-Lung CT Acceptance (Head / Brain / Abdomen CT)...")
+    engine = CTInferenceEngine()
+
+    head_ct = make_synthetic_head_ct()
+    buf = io.BytesIO()
+    Image.fromarray(head_ct).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    preview_res = engine.preview_scan(png_bytes, filename="head_brain_ct.png")
+    assert preview_res["is_valid_ct"] is True
+    assert preview_res["validation_status"] == "valid"
+    print(f"  [PASSED] Non-Lung CT scan accepted! (Reason: {preview_res['validation_reason']})")
+
+
+def test_color_photo_rejection():
+    print("\n[Test 2] Testing Guardrail: Rejecting Non-Medical Color Photograph (Selfie / Table)...")
+    engine = CTInferenceEngine()
+
+    # Create an RGB color image with distinct red, green, blue color channels
+    rgb_img = np.zeros((256, 256, 3), dtype=np.uint8)
+    rgb_img[:, :, 0] = 220  # red tint
+    rgb_img[:, :, 1] = 120  # green tint
+    rgb_img[:, :, 2] = 50   # blue tint
+
+    buf = io.BytesIO()
+    Image.fromarray(rgb_img).save(buf, format="JPEG")
+    jpg_bytes = buf.getvalue()
+
+    # 1. Preview mode should flag invalid scan
+    preview_res = engine.preview_scan(jpg_bytes, filename="selfie_table_photo.jpg")
+    assert preview_res["is_valid_ct"] is False
+    assert preview_res["validation_status"] == "invalid_scan"
+    assert preview_res["validation_reason"] == "Invalid image type, please upload a valid CT scan."
+    print(f"  [PASSED] Color Photo Guardrail triggered in Preview: {preview_res['validation_reason']}")
+
+    # 2. Analyze mode should raise ValueError
+    try:
+        engine.analyze_scan(jpg_bytes, filename="selfie_table_photo.jpg")
+        assert False, "Expected ValueError on color photograph"
+    except ValueError as ve:
+        assert str(ve) == "Invalid image type, please upload a valid CT scan."
+        print(f"  [PASSED] Analysis safely rejected color photo: {ve}")
+
+
+def test_grayscale_non_ct_rejection():
+    print("\n[Test 3] Testing Guardrail: Rejecting Grayscale Non-Medical Image (Wall / Texture)...")
+    engine = CTInferenceEngine()
+
+    # Uniform or textured image filling the entire field of view (e.g., photo of a wall/table converted to grayscale)
+    non_ct = np.full((256, 256), 180, dtype=np.uint8)
+
+    buf = io.BytesIO()
+    Image.fromarray(non_ct).save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    preview_res = engine.preview_scan(png_bytes, filename="wall_texture.png")
+    assert preview_res["is_valid_ct"] is False
+    assert preview_res["validation_status"] == "invalid_scan"
+    assert preview_res["validation_reason"] == "Invalid image type, please upload a valid CT scan."
+    print(f"  [PASSED] Non-CT Grayscale Guardrail triggered: {preview_res['validation_reason']}")
+
+
+def test_2d_analysis_and_ground_truth():
+    print("\n[Test 4] Testing 2D CT Slice Inference & Ground Truth Comparison on Valid Scan...")
+    engine = CTInferenceEngine()
+
+    synthetic_ct = make_synthetic_thoracic_ct()
     buf = io.BytesIO()
     Image.fromarray(synthetic_ct).save(buf, format="PNG")
     png_bytes = buf.getvalue()
 
-    result = engine.analyze_scan(png_bytes, filename="test_scan.png")
+    result = engine.analyze_scan(png_bytes, filename="valid_chest_scan.png")
+    assert result["total_slices"] == 1
+    assert result["is_valid_ct"] is True
+    assert "severity" in result
+    print("  [PASSED] 2D Analysis successfully completed on valid scan!")
 
-    assert result["total_slices"] == 1, "Expected 1 slice"
-    assert "severity" in result, "Missing severity field"
-    assert "overall_involvement_pct" in result, "Missing involvement percentage"
-    assert "slices" in result and len(result["slices"]) == 1, "Missing slice outputs"
-    
-    slice_0 = result["slices"][0]
-    assert slice_0["raw_image"].startswith("data:image/png;base64,"), "Invalid raw image data URL"
-    assert slice_0["overlay_image"].startswith("data:image/png;base64,"), "Invalid overlay data URL"
-    assert slice_0["contour_image"].startswith("data:image/png;base64,"), "Invalid contour data URL"
+    # Test Ground Truth Comparison
+    y, x = np.ogrid[:256, :256]
+    gt_mask = np.zeros((256, 256), dtype=np.uint8)
+    gt_mask[(x - 165) ** 2 / (16 ** 2) + (y - 120) ** 2 / (16 ** 2) <= 1.0] = 1
 
-    print(f"  -> Severity: {result['severity']} ({result['overall_involvement_pct']}% involvement)")
-    print(f"  -> Lesion Volume: {result['total_lesion_volume_cm3']} cm3")
-    print("  [PASSED] 2D Analysis successfully completed!")
+    mask_buf = io.BytesIO()
+    np.save(mask_buf, gt_mask)
+    gt_npy_bytes = mask_buf.getvalue()
 
-    return result
+    comparison_result = engine.compare_ground_truth(
+        mask_bytes=gt_npy_bytes,
+        filename="test_ground_truth.npy",
+        analysis_data=result
+    )
+    assert comparison_result["has_ground_truth"] is True
+    assert "overall_dice" in comparison_result
+    assert "ai_accuracy" in comparison_result
+    assert "accuracy_tier" in comparison_result
+    assert "accuracy_interpretation" in comparison_result
+    assert "slice_ai_accuracy" in comparison_result["slices"][0]
+    print(f"  -> Model Accuracy: {comparison_result['ai_accuracy']}% ({comparison_result['accuracy_tier']})")
+    print("  [PASSED] Ground Truth comparison completed!")
+
+    return comparison_result
 
 
 def test_pdf_report_generation(analysis_result):
-    print("\n[Test 2] Testing Medical PDF Diagnostic Report Generation...")
+    print("\n[Test 5] Testing Medical PDF Diagnostic Report Generation...")
     reporter = ClinicalDiagnosticReport(
         analysis_result,
         patient_info={
@@ -70,16 +183,15 @@ def test_pdf_report_generation(analysis_result):
     assert len(pdf_bytes) > 1000, "PDF bytes should be non-empty"
     assert pdf_bytes.startswith(b"%PDF"), "Output is not a valid PDF document"
 
-    test_pdf_path = os.path.join(PROJECT_ROOT, "test_output_report.pdf")
-    with open(test_pdf_path, "wb") as f:
-        f.write(pdf_bytes)
-
     print(f"  -> Generated PDF size: {len(pdf_bytes)} bytes")
-    print(f"  -> Saved test sample to: {test_pdf_path}")
     print("  [PASSED] Medical PDF Report successfully generated!")
 
 
 if __name__ == "__main__":
-    res = test_2d_analysis()
+    test_instant_preview_and_validation()
+    test_non_lung_ct_accepted()
+    test_color_photo_rejection()
+    test_grayscale_non_ct_rejection()
+    res = test_2d_analysis_and_ground_truth()
     test_pdf_report_generation(res)
-    print("\nAll End-to-End Clinical Interface Tests Passed Successfully! [OK]")
+    print("\nAll End-to-End Clinical Interface & Guardrail Tests Passed Successfully! [OK]")

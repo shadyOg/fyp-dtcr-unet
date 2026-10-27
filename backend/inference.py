@@ -163,10 +163,83 @@ class CTInferenceEngine:
             metadata["format"] = "standard_image"
             return vol.astype(np.float32), metadata
 
+    def validate_thoracic_ct(self, file_bytes: bytes, filename: str, vol: np.ndarray) -> Tuple[bool, str, Dict]:
+        """Validates whether an uploaded image/volume represents an authentic CT scan.
+        Accepts all forms of CT scans (thoracic, abdominal, head/brain, pelvic, etc.)
+        while rejecting non-CT imagery (color photos, selfies, edge-to-edge wallpapers).
+        """
+        INVALID_MSG = "Invalid image type, please upload a valid CT scan."
+        ext = filename.lower()
+        details = {
+            "is_color": False,
+            "color_discrepancy": 0.0,
+            "border_intensity": 0.0,
+            "body_contour_detected": False,
+        }
+
+        # 1. Color check for standard image formats (PNG, JPG, JPEG, BMP, WEBP)
+        if not (ext.endswith(".npy") or ext.endswith(".nii") or ext.endswith(".nii.gz") or ext.endswith(".dcm")):
+            try:
+                pil_img = Image.open(io.BytesIO(file_bytes))
+                if pil_img.mode in ("RGB", "RGBA"):
+                    rgb_arr = np.array(pil_img.convert("RGB"), dtype=np.float32)
+                    r, g, b = rgb_arr[:, :, 0], rgb_arr[:, :, 1], rgb_arr[:, :, 2]
+                    diff = float(np.mean(np.abs(r - g) + np.abs(g - b) + np.abs(b - r)))
+                    details["color_discrepancy"] = round(diff, 2)
+                    if diff > 8.0:
+                        details["is_color"] = True
+                        return False, INVALID_MSG, details
+            except Exception:
+                pass
+
+        # 2. Inspect central slice for radiological morphology
+        num_slices = vol.shape[0]
+        mid_idx = num_slices // 2
+        slice_arr = vol[mid_idx]
+        h, w = slice_arr.shape
+
+        if h < 64 or w < 64:
+            return False, INVALID_MSG, details
+
+        std_dev = float(np.std(slice_arr))
+        if std_dev < 0.03:
+            return False, INVALID_MSG, details
+
+        # 3. Outer border margin check (Scanner Field-of-View)
+        border_mask = np.zeros((h, w), dtype=bool)
+        b_th = max(2, int(min(h, w) * 0.03))
+        border_mask[:b_th, :] = True
+        border_mask[-b_th:, :] = True
+        border_mask[:, :b_th] = True
+        border_mask[:, -b_th:] = True
+
+        border_intensity = float(np.mean(slice_arr[border_mask]))
+        details["border_intensity"] = round(border_intensity, 3)
+
+        # 4. Body contour extraction (patient boundary inside scanner field of view)
+        body_thresh = (slice_arr > 0.08).astype(np.uint8)
+        contours, _ = cv2.findContours(body_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False, INVALID_MSG, details
+
+        largest_cnt = max(contours, key=cv2.contourArea)
+        body_area = float(cv2.contourArea(largest_cnt))
+        total_area = float(h * w)
+        body_ratio = body_area / max(total_area, 1.0)
+
+        # Natural photos / wallpapers fill edge-to-edge with bright pixels at border
+        if border_intensity > 0.35 and body_ratio > 0.90:
+            return False, INVALID_MSG, details
+
+        details["body_contour_detected"] = True
+        return True, "Valid CT scan.", details
+
     def preview_scan(self, file_bytes: bytes, filename: str) -> Dict:
         """Preprocesses any CT scan file (.npy, .dcm, .nii, .png, etc.) and generates raw slice images without running inference."""
         vol, meta = self.preprocess_image_bytes(file_bytes, filename)
         num_slices = vol.shape[0]
+
+        is_valid_ct, validation_reason, validation_details = self.validate_thoracic_ct(file_bytes, filename, vol)
 
         slices_data = []
         for s_idx in range(num_slices):
@@ -181,6 +254,10 @@ class CTInferenceEngine:
             "metadata": meta,
             "total_slices": num_slices,
             "is_preview": True,
+            "is_valid_ct": is_valid_ct,
+            "validation_status": "valid" if is_valid_ct else "invalid_scan",
+            "validation_reason": validation_reason,
+            "validation_details": validation_details,
             "slices": slices_data,
         }
 
@@ -195,6 +272,11 @@ class CTInferenceEngine:
         """Executes full clinical analysis on a 2D or 3D scan."""
         vol, meta = self.preprocess_image_bytes(file_bytes, filename)
         num_slices, orig_h, orig_w = vol.shape
+
+        # Verify scan anatomical validity
+        is_valid_ct, validation_reason, validation_details = self.validate_thoracic_ct(file_bytes, filename, vol)
+        if not is_valid_ct:
+            raise ValueError(validation_reason)
 
         slices_data = []
         total_lesion_pixels = 0
@@ -297,6 +379,8 @@ class CTInferenceEngine:
         return {
             "metadata": meta,
             "total_slices": num_slices,
+            "is_valid_ct": True,
+            "validation_status": "valid",
             "severity": severity,
             "severity_code": severity_code,
             "overall_involvement_pct": round(overall_involvement_pct, 2),
@@ -381,6 +465,7 @@ class CTInferenceEngine:
 
             slice_info["gt_overlay_image"] = gt_overlay_b64
             slice_info["composite_image"] = composite_b64
+            slice_info["slice_ai_accuracy"] = round(slice_dice, 1)
             slice_info["slice_dice"] = round(slice_dice, 1)
             slice_info["slice_iou"] = round(slice_iou, 1)
             slice_info["gt_pixels"] = int(np.sum(gt_binary))
@@ -401,10 +486,27 @@ class CTInferenceEngine:
         spec_denom = (total_tn + total_fp)
         overall_specificity = (total_tn / spec_denom * 100.0) if spec_denom > 0 else 100.0
 
+        ai_accuracy = round(overall_dice, 1)
+        if ai_accuracy >= 85.0:
+            accuracy_tier = "Excellent"
+            accuracy_interpretation = "High diagnostic fidelity with near-complete lesion boundary concordance."
+        elif ai_accuracy >= 70.0:
+            accuracy_tier = "Strong"
+            accuracy_interpretation = "Clinically sound lesion localization matching expert annotations."
+        elif ai_accuracy >= 50.0:
+            accuracy_tier = "Moderate"
+            accuracy_interpretation = "Partial boundary overlap with acceptable lesion detection."
+        else:
+            accuracy_tier = "Low"
+            accuracy_interpretation = "Noticeable boundary discrepancy compared to ground truth."
+
         return {
             **analysis_data,
             "has_ground_truth": True,
             "ground_truth_filename": filename,
+            "ai_accuracy": ai_accuracy,
+            "accuracy_tier": accuracy_tier,
+            "accuracy_interpretation": accuracy_interpretation,
             "overall_dice": round(overall_dice, 2),
             "overall_iou": round(overall_iou, 2),
             "overall_sensitivity": round(overall_sensitivity, 2),

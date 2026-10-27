@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Eye, Layers, ChevronLeft, ChevronRight, Sliders, Maximize2, UploadCloud, CheckCircle2, Play, Sparkles } from 'lucide-react';
+import { Eye, Layers, ChevronLeft, ChevronRight, Sliders, Maximize2, UploadCloud, CheckCircle2, Play, Sparkles, AlertTriangle, AlertCircle } from 'lucide-react';
 
 export default function RadiologyViewer({
   analysisData,
@@ -24,6 +24,7 @@ export default function RadiologyViewer({
   }
 
   const isPreview = Boolean(analysisData.is_preview);
+  const isValidCt = analysisData.is_valid_ct !== false;
   const slices = analysisData.slices;
   const currentSlice = slices[currentSliceIdx] || slices[0];
   const totalSlices = slices.length;
@@ -90,7 +91,7 @@ export default function RadiologyViewer({
         <div className="viewer-header-title">
           <Layers size={18} color="var(--color-brand-secondary)" />
           <span>{isPreview ? 'CT Scan Inspection Viewer' : 'Synchronized Radiology Canvas'}</span>
-          {isPreview && (
+          {isPreview && isValidCt && (
             <span style={{
               fontSize: '0.75rem',
               fontWeight: 600,
@@ -104,6 +105,24 @@ export default function RadiologyViewer({
               Preview Mode (Unanalyzed)
             </span>
           )}
+          {isPreview && !isValidCt && (
+            <span style={{
+              fontSize: '0.75rem',
+              fontWeight: 600,
+              padding: '0.2rem 0.6rem',
+              borderRadius: 'var(--radius-chip)',
+              background: 'rgba(229, 35, 35, 0.15)',
+              color: 'var(--color-status-severe)',
+              border: '1px solid rgba(229, 35, 35, 0.3)',
+              marginLeft: '0.5rem',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.35rem'
+            }}>
+              <AlertTriangle size={12} />
+              Invalid Image Type
+            </span>
+          )}
           {hasGroundTruth && !isPreview && (
             <span style={{
               fontSize: '0.75rem',
@@ -115,7 +134,7 @@ export default function RadiologyViewer({
               border: '1px solid rgba(23, 191, 40, 0.3)',
               marginLeft: '0.5rem'
             }}>
-              Dice Overlap: {currentSlice.slice_dice ?? analysisData.overall_dice}%
+              AI Accuracy: {currentSlice.slice_ai_accuracy ?? currentSlice.slice_dice ?? analysisData.ai_accuracy ?? analysisData.overall_dice}%
             </span>
           )}
         </div>
@@ -188,7 +207,7 @@ export default function RadiologyViewer({
                 Level Set Boundary
               </button>
             </div>
-          ) : (
+          ) : isValidCt ? (
             <button
               type="button"
               className="btn-primary"
@@ -208,6 +227,27 @@ export default function RadiologyViewer({
                 </>
               )}
             </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-secondary"
+              style={{
+                padding: '0.35rem 0.85rem',
+                fontSize: '0.8rem',
+                opacity: 0.6,
+                cursor: 'not-allowed',
+                color: 'var(--color-status-severe)',
+                borderColor: 'rgba(229, 35, 35, 0.4)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.35rem'
+              }}
+              disabled={true}
+              title={analysisData.validation_reason || 'Invalid image type, please upload a valid CT scan.'}
+            >
+              <AlertCircle size={14} />
+              <span>Analysis Disabled</span>
+            </button>
           )}
 
           <button
@@ -221,6 +261,33 @@ export default function RadiologyViewer({
           </button>
         </div>
       </div>
+
+      {/* Non-CT Warning Banner */}
+      {isPreview && !isValidCt && (
+        <div style={{
+          padding: '0.85rem 1.25rem',
+          background: 'rgba(229, 35, 35, 0.08)',
+          borderBottom: '1px solid rgba(229, 35, 35, 0.25)',
+          color: 'var(--color-text-bright)',
+          fontSize: '0.85rem',
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: '0.75rem'
+        }}>
+          <AlertCircle size={20} color="var(--color-status-severe)" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
+          <div>
+            <div style={{ fontWeight: 600, color: 'var(--color-status-severe)', marginBottom: '0.2rem' }}>
+              Non-Thoracic / Non-Medical Image Detected
+            </div>
+            <div style={{ color: 'var(--color-text-main)', lineHeight: 1.4 }}>
+              {analysisData.validation_reason || 'The uploaded file does not match thoracic CT scan morphology.'}
+            </div>
+            <div style={{ color: 'var(--color-text-muted)', fontSize: '0.78rem', marginTop: '0.25rem' }}>
+              AI pulmonary lesion analysis is locked to prevent diagnostic errors. Please upload an axial chest CT scan (.dcm, .nii, .npy, or grayscale CT slice).
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Side-by-Side Synchronized Canvases */}
       <div className="canvases-container" style={isPreview ? { gridTemplateColumns: '1fr' } : {}}>

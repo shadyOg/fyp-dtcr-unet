@@ -108,6 +108,11 @@ async def analyze_scan(
         )
         return JSONResponse(content={"success": True, "data": results})
 
+    except ValueError as ve:
+        return JSONResponse(
+            status_code=422,
+            content={"success": False, "error": str(ve)}
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
