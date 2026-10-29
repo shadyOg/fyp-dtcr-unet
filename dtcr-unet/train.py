@@ -120,7 +120,10 @@ def train_one_epoch(
         if skip_ratio > 0.5 or current_scale < 1.0:
             print(f"  [GradScaler Recovery] scale={current_scale:.1f}, skipped={skipped_batches}/{total_batches} "
                   f"({skip_ratio:.0%}) — resetting scale to 2^16")
-            scaler.update(new_scale=2**16)
+            try:
+                scaler._scale = torch.tensor(65536.0, dtype=torch.float32, device=device)
+            except Exception:
+                scaler.update()
 
     # Average over actual contributing batches (not total) to avoid artificially low loss
     divisor = max(total_batches, 1)  # Use total for consistent loss magnitude reporting
