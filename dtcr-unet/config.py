@@ -23,11 +23,16 @@ class DTCRConfig:
     weight_decay: float = 1e-4    # AdamW weight decay
     min_lr: float = 1e-6          # Cosine Annealing minimum learning rate
 
-    # Loss hyperparameters (Section 4.6)
+    # Loss hyperparameters (Section 4.6 & Eq. 8)
     beta: float = 0.5             # Gradient constraint weight for Supervised LSF loss
     lambda1: float = 0.3          # Gradient consistency weight for Dual-Task Consistency loss (optimal per paper Fig.7)
     lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss
     lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter
+    bce_weight: float = 0.2       # Background BCE weight (reduced to avoid severe lesion suppression)
+    dice_weight: float = 3.0      # Soft Dice weight (Eq. 8 primary objective)
+    pos_weight: float = 3.5       # Positive lesion pixel weighting in BCE
+    fuse_val: bool = True         # Dual-task prediction fusion during validation
+    val_threshold: float = 0.40   # Validation binarization threshold
 
     # Model architecture
     in_channels: int = 1

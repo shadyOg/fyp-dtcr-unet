@@ -55,10 +55,10 @@ class SupervisedSegLoss(nn.Module):
 
     def __init__(
         self,
-        bce_weight: float = 1.0,
-        dice_weight: float = 2.0,
+        bce_weight: float = 0.2,
+        dice_weight: float = 3.0,
         smooth: float = 1.0,
-        pos_weight: float = 1.0,
+        pos_weight: float = 3.5,
         use_focal: bool = False,
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,

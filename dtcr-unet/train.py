@@ -139,6 +139,8 @@ def evaluate_dataset(
     device: torch.device,
     criterion: Optional[torch.nn.Module] = None,
     use_amp: bool = True,
+    fuse_val: bool = True,
+    threshold: float = 0.40,
 ) -> dict:
     """Evaluate model on validation or test set, computing overall, lesion-only, and validation loss metrics."""
     model.eval()
@@ -168,11 +170,16 @@ def evaluate_dataset(
                     )
                     val_losses.append(batch_loss.item())
 
-                probs = torch.sigmoid(f1_logits).float().cpu().numpy()
+                f1_probs = torch.sigmoid(f1_logits)
+                if fuse_val:
+                    fused_probs = 0.5 * f1_probs + 0.5 * f2_trans
+                else:
+                    fused_probs = f1_probs
+                probs = fused_probs.float().cpu().numpy()
 
             masks_np = masks.cpu().numpy()
             for i in range(len(probs)):
-                m = compute_binary_metrics(probs[i, 0], masks_np[i, 0])
+                m = compute_binary_metrics(probs[i, 0], masks_np[i, 0], threshold=threshold)
                 all_metrics.append(m)
                 if masks_np[i, 0].sum() > 0:
                     lesion_metrics.append(m)
@@ -230,6 +237,9 @@ def train(
         lambda1=cfg.lambda1,
         lambda2=cfg.lambda2,
         beta=cfg.beta,
+        bce_weight=cfg.bce_weight,
+        dice_weight=cfg.dice_weight,
+        pos_weight=cfg.pos_weight,
     ).to(device)
 
     optimizer = optim.AdamW(
@@ -290,6 +300,8 @@ def train(
             device=device,
             criterion=criterion,
             use_amp=use_amp,
+            fuse_val=cfg.fuse_val,
+            threshold=cfg.val_threshold,
         )
         scheduler.step()
 
@@ -371,6 +383,11 @@ def main():
     parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4; use 1.0 for fully-supervised baseline)")
     parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
+    parser.add_argument("--bce-weight", type=float, default=0.2, help="BCE loss weight (default: 0.2 to avoid over-suppression)")
+    parser.add_argument("--dice-weight", type=float, default=3.0, help="Dice loss weight (default: 3.0 matching Eq. 8 priority)")
+    parser.add_argument("--pos-weight", type=float, default=3.5, help="Positive class weight in BCE (default: 3.5 for lesion balance)")
+    parser.add_argument("--val-threshold", type=float, default=0.40, help="Validation binarization threshold (default: 0.40)")
+    parser.add_argument("--no-fuse-val", action="store_true", help="Disable dual-task prediction fusion during validation")
     parser.add_argument("--no-filter-val", action="store_true", help="Include empty background slices in validation")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")
@@ -385,6 +402,11 @@ def main():
         labeled_ratio=args.labeled_ratio,
         lambda1=args.lambda1,
         lambda2=args.lambda2,
+        bce_weight=args.bce_weight,
+        dice_weight=args.dice_weight,
+        pos_weight=args.pos_weight,
+        fuse_val=not args.no_fuse_val,
+        val_threshold=args.val_threshold,
         checkpoint_dir=args.checkpoints,
         output_dir=args.outputs,
     )

@@ -92,12 +92,19 @@ class DTCRTotalLoss(nn.Module):
         lambda1: float = 1.0,
         lambda2: float = 1.0,
         beta: float = 0.5,
+        bce_weight: float = 0.2,
+        dice_weight: float = 3.0,
+        pos_weight: float = 3.5,
     ):
         super().__init__()
         from .seg_loss import SupervisedSegLoss
         from .lsf_loss import SupervisedLSFLoss
 
-        self.seg_criterion = SupervisedSegLoss()
+        self.seg_criterion = SupervisedSegLoss(
+            bce_weight=bce_weight,
+            dice_weight=dice_weight,
+            pos_weight=pos_weight,
+        )
         self.lsf_criterion = SupervisedLSFLoss(beta=beta)
         self.dtc_criterion = DualTaskConsistencyLoss(lambda1=lambda1, lambda2=lambda2)
 

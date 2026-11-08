@@ -92,8 +92,8 @@ def evaluate_checkpoint(
                     axes[1].axis("off")
 
                     axes[2].imshow(images_np[i, 0], cmap="gray")
-                    axes[2].imshow(probs[i, 0] > 0.5, cmap="Greens", alpha=0.4)
-                    axes[2].set_title(f"Task 1 Pred (Dice: {m['dice']:.1f}%)")
+                    axes[2].imshow(probs[i, 0] > threshold, cmap="Greens", alpha=0.4)
+                    axes[2].set_title(f"DTCR-U-Net Pred (Dice: {m['dice']:.1f}%)")
                     axes[2].axis("off")
 
                     axes[3].imshow(trans_probs[i, 0], cmap="jet")
