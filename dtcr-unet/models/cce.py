@@ -1,14 +1,15 @@
 """Channel Contextual Enhancement (CCE) Module for DTCR-U-Net.
 
-Implements Multi-Scale Feature Embedding (MSFE) and Channel Self-Attention with
-Global Channel Pooling (GCP) calibration as described in Section 3.2.1 and 3.2.2
-(Equations 11-16) of the DTCR-U-Net paper.
+Implements Multi-Scale Feature Embedding (MSFE), Channel Self-Attention with
+learnable Positional Encoding, Instance Normalization, and Global Channel
+Pooling (GCP) calibration as described in Section 3.2.1 and 3.2.2
+(Equations 11-16) and Fig. 2/3 of the DTCR-U-Net paper.
 """
 
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple
 
 
 class ChannelContextualEnhancement(nn.Module):
@@ -30,6 +31,7 @@ class ChannelContextualEnhancement(nn.Module):
         self.proj_dim = proj_dim
         self.token_size = token_size
         self.full_dim = len(in_channels_list) * proj_dim  # C_sigma = 4 * C = 512
+        seq_len = token_size[0] * token_size[1]           # d = 16 * 16 = 256
 
         # 1x1 convolutions for channel alignment to C = 128 (Eq. 11)
         self.align_convs = nn.ModuleList([
@@ -41,12 +43,16 @@ class ChannelContextualEnhancement(nn.Module):
             for in_c in in_channels_list
         ])
 
+        # Learnable Positional Encoding for tokenized multi-scale features (Fig. 2)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.full_dim, seq_len))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
         # Linear projection matrices for Channel Self-Attention (Eq. 14)
         self.q_proj = nn.Linear(self.full_dim, self.full_dim, bias=False)
         self.k_proj = nn.Linear(self.full_dim, self.full_dim, bias=False)
         self.v_proj = nn.Linear(self.full_dim, self.full_dim, bias=False)
 
-        # Instance Normalization for stabilizing channel similarity matrix
+        # Instance Normalization for stabilizing channel similarity matrix (Section 3.2.2 line 816)
         self.inst_norm = nn.InstanceNorm1d(self.full_dim)
 
         # Global Channel Pooling (GCP) calibration (Eq. 16)
@@ -70,9 +76,8 @@ class ChannelContextualEnhancement(nn.Module):
         Returns:
             F_CCE: Channel-enhanced feature map of shape (B, C_sigma, token_h, token_w).
         """
-        # Force entire attention computation in FP32 to prevent GradScaler
-        # overflow/underflow death spiral in both forward AND backward passes.
-        with torch.amp.autocast(device_type='cuda', enabled=False):
+        # Force attention computation in FP32 for numerical stability
+        with torch.amp.autocast(device_type="cuda", enabled=False):
             b = encoder_features[0].size(0)
             tokens = []
 
@@ -82,7 +87,7 @@ class ChannelContextualEnhancement(nn.Module):
             # 1. Channel alignment and tokenization (Eq. 11 & 12)
             for i, (conv, feat) in enumerate(zip(self.align_convs, encoder_features_fp32)):
                 aligned = conv(feat)  # (B, C, H_i, W_i)
-                # Pool to common spatial token size
+                # Pool to common spatial token size (16, 16) -> d = 256
                 pooled = F.adaptive_avg_pool2d(aligned, self.token_size)  # (B, C, h0, w0)
                 tokens.append(pooled)
 
@@ -90,8 +95,11 @@ class ChannelContextualEnhancement(nn.Module):
             # T_sigma shape: (B, C_sigma, h0, w0) -> flattened to (B, C_sigma, d) where d = h0 * w0
             t_sigma_spatial = torch.cat(tokens, dim=1)  # (B, C_sigma, h0, w0)
             h0, w0 = t_sigma_spatial.shape[2], t_sigma_spatial.shape[3]
-            d = h0 * w0
             t_sigma = t_sigma_spatial.flatten(2)  # (B, C_sigma, d)
+
+            # Add positional encoding per Fig. 2
+            if t_sigma.shape[2] == self.pos_embed.shape[2]:
+                t_sigma = t_sigma + self.pos_embed.to(dtype=t_sigma.dtype, device=t_sigma.device)
 
             # Transpose for linear projection across channel vectors: (B, d, C_sigma)
             t_trans = t_sigma.transpose(1, 2)
@@ -99,17 +107,19 @@ class ChannelContextualEnhancement(nn.Module):
             k_c = self.k_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
             v_c = self.v_proj(t_trans).transpose(1, 2)  # (B, C_sigma, d)
 
-            # 3. Channel dot-product attention matrix M_c (Eq. 15)
+            # 3. Channel dot-product attention matrix M_c (Eq. 15) with Instance Normalization
             scale = float(self.full_dim) ** 0.5
-            sim = torch.bmm(q_c, k_c.transpose(1, 2)) / scale
-            sim_max = torch.max(sim, dim=-1, keepdim=True)[0]
-            m_c = F.softmax(sim - sim_max, dim=-1)
+            sim = torch.bmm(q_c, k_c.transpose(1, 2)) / scale  # (B, C_sigma, C_sigma)
+
+            # Apply instance normalization to similarity matrix per Section 3.2.2 line 816
+            sim_norm = self.inst_norm(sim)
+            sim_max = torch.max(sim_norm, dim=-1, keepdim=True)[0]
+            m_c = F.softmax(sim_norm - sim_max, dim=-1)
 
             # 4. Weight value matrix and residual connection: (B, C_sigma, d)
             attended = torch.bmm(m_c, v_c) + t_sigma
 
             # 5. Global Channel Pooling (GCP) calibration (Eq. 16)
-            # GAP across sequence dimension d
             gap = attended.mean(dim=-1)  # (B, C_sigma)
             gamma = self.fc_gamma(gap).unsqueeze(-1)  # (B, C_sigma, 1)
             beta = self.fc_beta(gap).unsqueeze(-1)    # (B, C_sigma, 1)
