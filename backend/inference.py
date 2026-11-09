@@ -64,10 +64,14 @@ class CTInferenceEngine:
                 ckpt = torch.load(target_path, map_location=self.device)
                 state_dict = ckpt.get("model_state_dict", ckpt.get("model_state", ckpt.get("state_dict", ckpt)))
                 
-                # Check base_c from config if present
+                # Check base_c and num_stages from config or state_dict
                 cfg = ckpt.get("config", {})
                 base_c = cfg.get("base_c", 64) if isinstance(cfg, dict) else 64
-                self.model = DTCR_UNet(in_channels=1, n_classes=1, base_c=base_c)
+                if isinstance(cfg, dict) and "num_stages" in cfg:
+                    num_stages = cfg["num_stages"]
+                else:
+                    num_stages = 5 if any("down4" in k for k in state_dict.keys()) else 4
+                self.model = DTCR_UNet(in_channels=1, n_classes=1, base_c=base_c, num_stages=num_stages)
                 
                 try:
                     self.model.load_state_dict(state_dict, strict=True)
