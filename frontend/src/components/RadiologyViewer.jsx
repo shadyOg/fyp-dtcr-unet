@@ -1,5 +1,20 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Eye, Layers, ChevronLeft, ChevronRight, Sliders, Maximize2, UploadCloud, CheckCircle2, Play, Sparkles, AlertTriangle, AlertCircle } from 'lucide-react';
+import {
+  Layers,
+  ChevronLeft,
+  ChevronRight,
+  Sliders,
+  Maximize2,
+  Minimize2,
+  UploadCloud,
+  CheckCircle2,
+  Sparkles,
+  AlertCircle,
+  Eye,
+  Play,
+  Pause,
+  RotateCcw
+} from 'lucide-react';
 
 export default function RadiologyViewer({
   analysisData,
@@ -12,29 +27,86 @@ export default function RadiologyViewer({
   const [overlayOpacity, setOverlayOpacity] = useState(0.75);
   const [viewMode, setViewMode] = useState('overlay'); // 'overlay' | 'gt' | 'composite' | 'contour'
   const [zoomLevel, setZoomLevel] = useState(1);
+  const [isPlayingCine, setIsPlayingCine] = useState(false);
   const maskInputRef = useRef(null);
+  const viewerContainerRef = useRef(null);
 
+  // Reset slice index & zoom when a new file is loaded
   useEffect(() => {
     setCurrentSliceIdx(0);
     setZoomLevel(1);
+    setIsPlayingCine(false);
   }, [analysisData?.metadata?.filename]);
 
-  if (!analysisData || !analysisData.slices || analysisData.slices.length === 0) {
+  const slices = analysisData?.slices || [];
+  const totalSlices = slices.length;
+  const isPreview = Boolean(analysisData?.is_preview);
+  const isValidCt = analysisData?.is_valid_ct !== false;
+  const hasGroundTruth = Boolean(analysisData?.has_ground_truth);
+  const currentSlice = slices[currentSliceIdx] || slices[0];
+
+  // Cine-loop playback for multi-slice 3D CT volumes (pauses if modal is open)
+  useEffect(() => {
+    if (!isPlayingCine || totalSlices <= 1) return;
+    const interval = setInterval(() => {
+      const isModalOpen = Boolean(
+        document.querySelector('[role="dialog"]') ||
+        document.querySelector('.modal-overlay')
+      );
+      if (isModalOpen) return;
+      setCurrentSliceIdx((prev) => (prev + 1) % totalSlices);
+    }, 180);
+    return () => clearInterval(interval);
+  }, [isPlayingCine, totalSlices]);
+
+  // Keyboard navigation for slice stepping (skips if inside active input or modal dialog)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      const activeEl = document.activeElement;
+      const targetTag = e.target?.tagName?.toUpperCase();
+      const activeTag = activeEl?.tagName?.toUpperCase();
+      const inputTags = ['INPUT', 'SELECT', 'TEXTAREA'];
+
+      const isInputActive =
+        inputTags.includes(targetTag) ||
+        inputTags.includes(activeTag) ||
+        Boolean(e.target?.isContentEditable) ||
+        Boolean(activeEl?.isContentEditable);
+
+      const isModalOpen = Boolean(
+        document.querySelector('[role="dialog"]') ||
+        document.querySelector('.modal-overlay')
+      );
+
+      if (isInputActive || isModalOpen) return;
+      if (totalSlices <= 1) return;
+
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        setIsPlayingCine(false);
+        setCurrentSliceIdx((prev) => Math.max(0, prev - 1));
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        setIsPlayingCine(false);
+        setCurrentSliceIdx((prev) => Math.min(totalSlices - 1, prev + 1));
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [totalSlices]);
+
+  if (!analysisData || !slices || slices.length === 0) {
     return null;
   }
 
-  const isPreview = Boolean(analysisData.is_preview);
-  const isValidCt = analysisData.is_valid_ct !== false;
-  const slices = analysisData.slices;
-  const currentSlice = slices[currentSliceIdx] || slices[0];
-  const totalSlices = slices.length;
-  const hasGroundTruth = Boolean(analysisData.has_ground_truth);
-
   const handlePrevSlice = () => {
+    setIsPlayingCine(false);
     setCurrentSliceIdx((prev) => Math.max(0, prev - 1));
   };
 
   const handleNextSlice = () => {
+    setIsPlayingCine(false);
     setCurrentSliceIdx((prev) => Math.min(totalSlices - 1, prev + 1));
   };
 
@@ -42,19 +114,22 @@ export default function RadiologyViewer({
     if (e.target.files && e.target.files.length > 0) {
       onUploadGroundTruth(e.target.files[0]);
     }
+    // Reset file input value so selecting the same mask triggers change cleanly
+    e.target.value = '';
   };
 
   const getForegroundImage = () => {
+    if (!currentSlice) return '';
     if (viewMode === 'gt' && currentSlice.gt_overlay_image) {
       return currentSlice.gt_overlay_image;
     }
     if (viewMode === 'composite' && currentSlice.composite_image) {
       return currentSlice.composite_image;
     }
-    if (viewMode === 'contour') {
+    if (viewMode === 'contour' && currentSlice.contour_image) {
       return currentSlice.contour_image;
     }
-    return currentSlice.overlay_image;
+    return currentSlice.overlay_image || currentSlice.raw_image;
   };
 
   const getCanvasTitle = () => {
@@ -67,162 +142,158 @@ export default function RadiologyViewer({
         return 'Level Set Boundary Contour';
       case 'overlay':
       default:
-        return 'AI Model Lesion Prediction';
+        return 'AI Lesion Prediction (Overlay)';
     }
   };
 
-  const getCanvasBadgeColor = () => {
-    switch (viewMode) {
-      case 'gt':
-        return 'rgba(23, 191, 40, 0.4)';
-      case 'composite':
-        return 'rgba(236, 148, 44, 0.4)';
-      case 'contour':
-        return 'rgba(37, 180, 248, 0.4)';
-      case 'overlay':
-      default:
-        return 'rgba(168, 101, 200, 0.4)';
-    }
+  const formatMetric = (val) => {
+    if (val === undefined || val === null) return '0.0';
+    const num = Number(val);
+    if (!isFinite(num)) return '0.0';
+    return num.toFixed(1);
   };
+
+  const displayAccuracy = currentSlice?.slice_ai_accuracy ?? currentSlice?.slice_dice ?? analysisData.ai_accuracy ?? analysisData.overall_dice;
 
   return (
-    <div className="viewer-card">
+    <section
+      ref={viewerContainerRef}
+      className="viewer-card"
+      aria-label="Synchronized Radiology Image Viewer"
+    >
+      {/* Viewer Header Toolbar */}
       <div className="viewer-header">
-        <div className="viewer-header-title">
-          <Layers size={18} color="var(--color-brand-secondary)" />
-          <span>{isPreview ? 'CT Scan Inspection Viewer' : 'Synchronized Radiology Canvas'}</span>
+        <div className="viewer-header-left">
+          <div className="viewer-header-title">
+            <Layers size={18} color="var(--color-brand-secondary)" strokeWidth={2} aria-hidden="true" />
+            <span>{isPreview ? 'CT Scan Inspection' : 'Synchronized Radiology Canvas'}</span>
+          </div>
+
           {isPreview && isValidCt && (
-            <span style={{
-              fontSize: '0.75rem',
-              fontWeight: 600,
-              padding: '0.2rem 0.6rem',
-              borderRadius: 'var(--radius-chip)',
-              background: 'rgba(37, 180, 248, 0.15)',
-              color: 'var(--color-accent-sky)',
-              border: '1px solid rgba(37, 180, 248, 0.3)',
-              marginLeft: '0.5rem'
-            }}>
+            <span
+              style={{
+                fontSize: 'var(--text-xs)',
+                fontWeight: 600,
+                padding: '0.2rem 0.6rem',
+                borderRadius: 'var(--radius-pill)',
+                background: 'var(--color-action-tint)',
+                color: 'var(--color-action-blue)',
+                border: '1px solid rgba(10, 132, 255, 0.28)',
+              }}
+            >
               Preview Mode (Unanalyzed)
             </span>
           )}
+
           {isPreview && !isValidCt && (
-            <span style={{
-              fontSize: '0.75rem',
-              fontWeight: 600,
-              padding: '0.2rem 0.6rem',
-              borderRadius: 'var(--radius-chip)',
-              background: 'rgba(229, 35, 35, 0.15)',
-              color: 'var(--color-status-severe)',
-              border: '1px solid rgba(229, 35, 35, 0.3)',
-              marginLeft: '0.5rem',
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '0.35rem'
-            }}>
-              <AlertTriangle size={12} />
-              Invalid Image Type
+            <span
+              style={{
+                fontSize: 'var(--text-xs)',
+                fontWeight: 600,
+                padding: '0.2rem 0.6rem',
+                borderRadius: 'var(--radius-pill)',
+                background: 'var(--color-status-severe-bg)',
+                color: 'var(--color-status-severe)',
+                border: '1px solid var(--color-status-severe-border)',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '0.35rem'
+              }}
+            >
+              <AlertCircle size={12} strokeWidth={2} aria-hidden="true" />
+              Invalid Image Input
             </span>
           )}
+
           {hasGroundTruth && !isPreview && (
-            <span style={{
-              fontSize: '0.75rem',
-              fontWeight: 600,
-              padding: '0.2rem 0.6rem',
-              borderRadius: 'var(--radius-chip)',
-              background: 'rgba(23, 191, 40, 0.15)',
-              color: 'var(--color-status-clear)',
-              border: '1px solid rgba(23, 191, 40, 0.3)',
-              marginLeft: '0.5rem'
-            }}>
-              AI Accuracy: {currentSlice.slice_ai_accuracy ?? currentSlice.slice_dice ?? analysisData.ai_accuracy ?? analysisData.overall_dice}%
+            <span
+              style={{
+                fontSize: 'var(--text-xs)',
+                fontWeight: 600,
+                padding: '0.2rem 0.6rem',
+                borderRadius: 'var(--radius-pill)',
+                background: 'var(--color-status-clear-bg)',
+                color: 'var(--color-status-clear)',
+                border: '1px solid var(--color-status-clear-border)',
+              }}
+            >
+              Accuracy: {formatMetric(displayAccuracy)}%
             </span>
           )}
         </div>
 
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+        <div className="viewer-header-right">
+          {/* Segmented View Mode Switcher (Analyzed Mode) */}
           {!isPreview ? (
-            /* View Mode Switcher */
-            <div style={{ display: 'flex', background: 'rgba(255, 255, 255, 0.05)', borderRadius: 'var(--radius-chip)', padding: 2 }}>
+            <div
+              className="segmented-control"
+              role="radiogroup"
+              aria-label="Radiology Layer Presentation"
+            >
               <button
                 type="button"
-                className="btn-secondary"
-                style={{
-                  padding: '0.25rem 0.65rem',
-                  fontSize: '0.75rem',
-                  border: 'none',
-                  background: viewMode === 'overlay' ? 'var(--color-brand-primary)' : 'transparent',
-                  color: viewMode === 'overlay' ? '#fff' : 'var(--color-text-muted)',
-                }}
+                className={`segmented-option ${viewMode === 'overlay' ? 'active' : ''}`}
                 onClick={() => setViewMode('overlay')}
+                role="radio"
+                aria-checked={viewMode === 'overlay'}
               >
-                AI Prediction (Red)
+                <span className="segmented-dot" style={{ backgroundColor: '#EF4444' }} />
+                <span>AI Prediction</span>
               </button>
 
               {hasGroundTruth && (
                 <>
                   <button
                     type="button"
-                    className="btn-secondary"
-                    style={{
-                      padding: '0.25rem 0.65rem',
-                      fontSize: '0.75rem',
-                      border: 'none',
-                      background: viewMode === 'gt' ? 'var(--color-status-clear)' : 'transparent',
-                      color: viewMode === 'gt' ? '#fff' : 'var(--color-text-muted)',
-                    }}
+                    className={`segmented-option ${viewMode === 'gt' ? 'active' : ''}`}
                     onClick={() => setViewMode('gt')}
+                    role="radio"
+                    aria-checked={viewMode === 'gt'}
                   >
-                    Ground Truth (Green)
+                    <span className="segmented-dot" style={{ backgroundColor: '#10B981' }} />
+                    <span>Ground Truth</span>
                   </button>
 
                   <button
                     type="button"
-                    className="btn-secondary"
-                    style={{
-                      padding: '0.25rem 0.65rem',
-                      fontSize: '0.75rem',
-                      border: 'none',
-                      background: viewMode === 'composite' ? 'var(--color-status-moderate)' : 'transparent',
-                      color: viewMode === 'composite' ? '#fff' : 'var(--color-text-muted)',
-                    }}
+                    className={`segmented-option ${viewMode === 'composite' ? 'active' : ''}`}
                     onClick={() => setViewMode('composite')}
+                    role="radio"
+                    aria-checked={viewMode === 'composite'}
                   >
-                    Overlap Comparison
+                    <span className="segmented-dot" style={{ backgroundColor: '#F59E0B' }} />
+                    <span>Overlap</span>
                   </button>
                 </>
               )}
 
               <button
                 type="button"
-                className="btn-secondary"
-                style={{
-                  padding: '0.25rem 0.65rem',
-                  fontSize: '0.75rem',
-                  border: 'none',
-                  background: viewMode === 'contour' ? 'var(--color-action-blue)' : 'transparent',
-                  color: viewMode === 'contour' ? '#fff' : 'var(--color-text-muted)',
-                }}
+                className={`segmented-option ${viewMode === 'contour' ? 'active' : ''}`}
                 onClick={() => setViewMode('contour')}
+                role="radio"
+                aria-checked={viewMode === 'contour'}
               >
-                Level Set Boundary
+                <span className="segmented-dot" style={{ backgroundColor: '#0EA5E9' }} />
+                <span>Boundary</span>
               </button>
             </div>
           ) : isValidCt ? (
             <button
               type="button"
               className="btn-primary"
-              style={{ padding: '0.35rem 0.85rem', fontSize: '0.8rem' }}
               onClick={onAnalyze}
               disabled={isAnalyzing}
+              aria-label="Run Dual-Task CT Lesion Analysis"
             >
               {isAnalyzing ? (
                 <>
-                  <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                  <div className="spinner" aria-hidden="true" />
                   <span>Analyzing...</span>
                 </>
               ) : (
                 <>
-                  <Sparkles size={14} />
+                  <Sparkles size={14} strokeWidth={2} aria-hidden="true" />
                   <span>Run AI Lesion Analysis</span>
                 </>
               )}
@@ -231,259 +302,355 @@ export default function RadiologyViewer({
             <button
               type="button"
               className="btn-secondary"
-              style={{
-                padding: '0.35rem 0.85rem',
-                fontSize: '0.8rem',
-                opacity: 0.6,
-                cursor: 'not-allowed',
-                color: 'var(--color-status-severe)',
-                borderColor: 'rgba(229, 35, 35, 0.4)',
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '0.35rem'
-              }}
               disabled={true}
-              title={analysisData.validation_reason || 'Invalid image type, please upload a valid CT scan.'}
+              style={{
+                opacity: 0.6,
+                color: 'var(--color-status-severe)',
+                borderColor: 'var(--color-status-severe-border)',
+                cursor: 'not-allowed'
+              }}
+              title={analysisData.validation_reason || 'Invalid scan morphology.'}
             >
-              <AlertCircle size={14} />
-              <span>Analysis Disabled</span>
+              <AlertCircle size={14} strokeWidth={2} aria-hidden="true" />
+              <span>Analysis Locked</span>
             </button>
           )}
 
+          {/* 1.5x Zoom Inspection Toggle */}
           <button
             type="button"
-            className="btn-secondary"
-            style={{ padding: '0.35rem 0.6rem' }}
+            className="btn-icon"
             onClick={() => setZoomLevel((z) => (z === 1 ? 1.5 : 1))}
-            title="Toggle 1.5x Zoom"
+            title={zoomLevel === 1 ? 'Zoom In (1.5x)' : 'Reset Zoom'}
+            aria-label={zoomLevel === 1 ? 'Magnify scan to 1.5x' : 'Reset magnification to default'}
           >
-            <Maximize2 size={14} />
+            {zoomLevel === 1 ? (
+              <Maximize2 size={15} strokeWidth={1.8} aria-hidden="true" />
+            ) : (
+              <Minimize2 size={15} strokeWidth={1.8} aria-hidden="true" />
+            )}
           </button>
         </div>
       </div>
 
-      {/* Non-CT Warning Banner */}
+      {/* Non-CT Guardrail Warning Banner */}
       {isPreview && !isValidCt && (
-        <div style={{
-          padding: '0.85rem 1.25rem',
-          background: 'rgba(229, 35, 35, 0.08)',
-          borderBottom: '1px solid rgba(229, 35, 35, 0.25)',
-          color: 'var(--color-text-bright)',
-          fontSize: '0.85rem',
-          display: 'flex',
-          alignItems: 'flex-start',
-          gap: '0.75rem'
-        }}>
-          <AlertCircle size={20} color="var(--color-status-severe)" style={{ flexShrink: 0, marginTop: '0.1rem' }} />
+        <div
+          role="alert"
+          style={{
+            padding: '1rem 1.25rem',
+            background: 'var(--color-status-severe-bg)',
+            border: '1px solid var(--color-status-severe-border)',
+            borderRadius: 'var(--radius-card)',
+            color: 'var(--color-text-primary)',
+            fontSize: 'var(--text-sm)',
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: '0.875rem'
+          }}
+        >
+          <AlertCircle
+            size={22}
+            color="var(--color-status-severe)"
+            strokeWidth={2}
+            style={{ flexShrink: 0, marginTop: '0.1rem' }}
+            aria-hidden="true"
+          />
           <div>
             <div style={{ fontWeight: 600, color: 'var(--color-status-severe)', marginBottom: '0.2rem' }}>
-              Non-Thoracic / Non-Medical Image Detected
+              Non-Thoracic or Non-Medical Image Detected
             </div>
-            <div style={{ color: 'var(--color-text-main)', lineHeight: 1.4 }}>
+            <div style={{ color: 'var(--color-text-primary)', lineHeight: 1.45 }}>
               {analysisData.validation_reason || 'The uploaded file does not match thoracic CT scan morphology.'}
             </div>
-            <div style={{ color: 'var(--color-text-muted)', fontSize: '0.78rem', marginTop: '0.25rem' }}>
-              AI pulmonary lesion analysis is locked to prevent diagnostic errors. Please upload an axial chest CT scan (.dcm, .nii, .npy, or grayscale CT slice).
+            <div style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--text-xs)', marginTop: '0.35rem' }}>
+              Diagnostic lesion segmentation is locked to prevent clinical errors. Please upload an axial chest CT scan (.dcm, .nii, .npy, or grayscale CT slice).
             </div>
           </div>
         </div>
       )}
 
-      {/* Side-by-Side Synchronized Canvases */}
+      {/* Synchronized Side-by-Side Dual Viewport Canvases */}
       <div className="canvases-container" style={isPreview ? { gridTemplateColumns: '1fr' } : {}}>
-        {/* Left: Original CT */}
-        <div className="canvas-wrapper" style={isPreview ? { maxHeight: '520px', aspectRatio: 'unset' } : {}}>
+        {/* Left Viewport: Raw Base CT Scan */}
+        <div
+          className="canvas-wrapper"
+          style={isPreview ? { maxHeight: '520px', aspectRatio: 'unset' } : {}}
+        >
           <div className="canvas-label-badge">
-            {isPreview ? `CT Scan Inspection — Slice ${currentSliceIdx + 1} of ${totalSlices}` : 'Raw CT Scan'}
+            <Eye size={12} strokeWidth={2} aria-hidden="true" />
+            <span>
+              {isPreview
+                ? `CT Scan Inspection — Slice ${currentSliceIdx + 1} of ${totalSlices}`
+                : `Raw CT Scan (Slice ${currentSliceIdx + 1}/${totalSlices})`}
+            </span>
           </div>
+
           <img
-            src={currentSlice.raw_image}
-            alt={`CT Slice ${currentSliceIdx + 1}`}
+            src={currentSlice?.raw_image}
+            alt={`Raw CT Scan slice ${currentSliceIdx + 1} of ${totalSlices}`}
             className="canvas-img"
-            style={{ transform: `scale(${zoomLevel})`, transition: 'transform 0.2s ease', maxHeight: '500px' }}
+            style={{
+              transform: `scale(${zoomLevel})`,
+              transformOrigin: 'center center',
+              transition: 'transform var(--duration-fast) var(--ease-apple)',
+              willChange: 'transform',
+              maxHeight: isPreview ? '520px' : '100%'
+            }}
           />
         </div>
 
-        {/* Right: Selected Analysis Layer (Visible once analyzed) */}
+        {/* Right Viewport: AI Prediction / Doctor GT / Overlap Layer (Shown once analyzed) */}
         {!isPreview && (
           <div className="canvas-wrapper">
-            <div className="canvas-label-badge" style={{ borderColor: getCanvasBadgeColor() }}>
-              {getCanvasTitle()}
+            <div className="canvas-label-badge">
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  backgroundColor:
+                    viewMode === 'gt'
+                      ? '#10B981'
+                      : viewMode === 'composite'
+                        ? '#F59E0B'
+                        : viewMode === 'contour'
+                          ? '#0EA5E9'
+                          : '#EF4444'
+                }}
+              />
+              <span>{getCanvasTitle()}</span>
             </div>
 
-            {/* Background raw slice */}
+            {/* Base CT image underlay - purely decorative background for overlay blending */}
             <img
-              src={currentSlice.raw_image}
-              alt="Base CT"
-              className="canvas-img"
-              style={{ position: 'absolute', top: 0, left: 0, transform: `scale(${zoomLevel})` }}
-            />
-
-            {/* Foreground overlay layer */}
-            <img
-              src={getForegroundImage()}
-              alt="Layer"
+              src={currentSlice?.raw_image}
+              alt=""
+              aria-hidden="true"
               className="canvas-img"
               style={{
-                position: 'relative',
-                opacity: overlayOpacity,
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
                 transform: `scale(${zoomLevel})`,
-                transition: 'transform 0.2s ease',
+                transformOrigin: 'center center',
+                transition: 'transform var(--duration-fast) var(--ease-apple)',
+                willChange: 'transform'
               }}
             />
 
-            {currentSlice.has_lesion && viewMode === 'overlay' && (
-              <div className="canvas-indicator-badge">
-                Infection: {currentSlice.involvement_pct}%
+            {/* Diagnostic Foreground Overlay with controlled opacity */}
+            <img
+              src={getForegroundImage()}
+              alt={`${getCanvasTitle()} for slice ${currentSliceIdx + 1}`}
+              className="canvas-img"
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
+                opacity: overlayOpacity,
+                transform: `scale(${zoomLevel})`,
+                transformOrigin: 'center center',
+                transition: 'opacity var(--duration-fast) ease, transform var(--duration-fast) var(--ease-apple)',
+                willChange: 'transform'
+              }}
+            />
+
+            {currentSlice?.has_lesion && viewMode === 'overlay' && (
+              <div
+                className="canvas-indicator-badge tabular-nums"
+                style={{ background: 'rgba(239, 68, 68, 0.92)' }}
+              >
+                Lesion Involvement: {formatMetric(currentSlice.involvement_pct)}%
               </div>
             )}
 
             {hasGroundTruth && viewMode === 'composite' && (
-              <div className="canvas-indicator-badge" style={{ background: 'rgba(1, 22, 50, 0.85)', border: '1px solid rgba(255,255,255,0.2)' }}>
-                🟡 Overlap | 🟢 GT Only | 🔴 AI Only
+              <div
+                className="canvas-indicator-badge"
+                style={{
+                  background: 'rgba(17, 22, 34, 0.95)',
+                  borderColor: 'rgba(255, 255, 255, 0.18)'
+                }}
+              >
+                🟡 Overlap | 🟢 Doctor GT | 🔴 AI Prediction
               </div>
             )}
           </div>
         )}
       </div>
 
-      {/* Ground Truth Upload Card (Available after analysis) */}
+      {/* Ground Truth Doctor Annotation Card (Available after analysis) */}
       {!isPreview && (
-        <div style={{
-          background: hasGroundTruth ? 'rgba(23, 191, 40, 0.06)' : 'rgba(255, 255, 255, 0.02)',
-          border: `1px dashed ${hasGroundTruth ? 'rgba(23, 191, 40, 0.35)' : 'var(--color-card-border)'}`,
-          borderRadius: 'var(--radius-module)',
-          padding: '0.85rem 1.25rem',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: '1rem',
-        }}>
+        <div className={`gt-panel ${hasGroundTruth ? 'loaded' : ''}`}>
           <input
             type="file"
             ref={maskInputRef}
             onChange={handleMaskFileChange}
             style={{ display: 'none' }}
             accept=".npy,.png,.jpg,.jpeg,.dcm,.nii,.nii.gz"
+            tabIndex={-1}
           />
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <div style={{
-              width: 36,
-              height: 36,
-              borderRadius: '50%',
-              background: hasGroundTruth ? 'rgba(23, 191, 40, 0.15)' : 'rgba(112, 0, 165, 0.15)',
-              color: hasGroundTruth ? 'var(--color-status-clear)' : 'var(--color-brand-secondary)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center'
-            }}>
-              {hasGroundTruth ? <CheckCircle2 size={20} /> : <UploadCloud size={20} />}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.875rem' }}>
+            <div className="gt-icon-circle" aria-hidden="true">
+              {hasGroundTruth ? (
+                <CheckCircle2 size={18} strokeWidth={2} />
+              ) : (
+                <UploadCloud size={18} strokeWidth={2} />
+              )}
             </div>
             <div>
-              <div style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--color-text-bright)' }}>
-                {hasGroundTruth ? `Ground Truth Loaded: ${analysisData.ground_truth_filename}` : 'Upload Ground Truth Mask (.npy / .png / .nii)'}
-              </div>
-              <div style={{ fontSize: '0.78rem', color: 'var(--color-text-muted)' }}>
+              <div style={{ fontWeight: 600, fontSize: 'var(--text-sm)', color: 'var(--color-text-primary)' }}>
                 {hasGroundTruth
-                  ? `Overall Agreement: ${analysisData.overall_dice}% Dice | ${analysisData.overall_iou}% IoU | Sensitivity: ${analysisData.overall_sensitivity}%`
-                  : 'Upload the radiologist\'s ground truth mask to compare what the model predicted vs. actual truth.'}
+                  ? `Ground Truth Loaded: ${analysisData.ground_truth_filename}`
+                  : 'Upload Ground Truth Annotation (.npy / .png / .nii)'}
+              </div>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginTop: '0.15rem' }}>
+                {hasGroundTruth
+                  ? `Overall Agreement: ${formatMetric(analysisData.overall_dice)}% Dice | ${formatMetric(analysisData.overall_iou)}% IoU | Sensitivity: ${formatMetric(analysisData.overall_sensitivity)}%`
+                  : 'Compare the deep learning model predictions against official radiologist contour masks.'}
               </div>
             </div>
           </div>
 
-          <div>
-            <button
-              type="button"
-              className="btn-secondary"
-              style={{
-                borderColor: hasGroundTruth ? 'rgba(23, 191, 40, 0.4)' : 'var(--color-border-subtle)',
-                color: hasGroundTruth ? 'var(--color-status-clear)' : 'var(--color-text-main)',
-              }}
-              onClick={() => maskInputRef.current?.click()}
-              disabled={isComparingGt}
-            >
-              {isComparingGt ? (
-                <>
-                  <div className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
-                  <span>Comparing...</span>
-                </>
-              ) : hasGroundTruth ? (
-                'Upload Different Mask'
-              ) : (
-                'Upload Mask & Compare'
-              )}
-            </button>
-          </div>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => maskInputRef.current?.click()}
+            disabled={isComparingGt}
+            aria-label="Upload ground truth mask to compare with AI predictions"
+          >
+            {isComparingGt ? (
+              <>
+                <div className="spinner" aria-hidden="true" />
+                <span>Comparing Mask...</span>
+              </>
+            ) : hasGroundTruth ? (
+              'Replace Mask'
+            ) : (
+              'Upload Mask & Compare'
+            )}
+          </button>
         </div>
       )}
 
-      {/* Interactive Controls Bar */}
+      {/* Interactive Telemetry & Navigation Controls Bar */}
       <div className="viewer-controls-bar">
-        {/* Opacity Blending Slider (Shown when analyzed) */}
+        {/* Layer Opacity Blending Slider (Shown when analyzed) */}
         {!isPreview && (
           <div className="control-row">
-            <div className="control-label">
-              <Sliders size={16} />
+            <label htmlFor="overlay-opacity-slider" className="control-label">
+              <Sliders size={15} strokeWidth={1.8} aria-hidden="true" />
               <span>Layer Blend Opacity</span>
-            </div>
+            </label>
+
             <div className="slider-group">
               <input
+                id="overlay-opacity-slider"
                 type="range"
                 min="0"
                 max="1"
                 step="0.05"
                 value={overlayOpacity}
                 onChange={(e) => setOverlayOpacity(parseFloat(e.target.value))}
-                className="custom-range"
+                className="apple-range"
+                aria-label="Adjust AI overlay transparency"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(overlayOpacity * 100)}
               />
-              <span className="slider-val-badge">{Math.round(overlayOpacity * 100)}%</span>
+              <span className="slider-val-badge tabular-nums">
+                {Math.round(overlayOpacity * 100)}%
+              </span>
             </div>
           </div>
         )}
 
-        {/* 3D Volumetric Slice Navigator (Works in both Preview and Analyzed modes!) */}
+        {/* 3D Volumetric Axial Slice Navigator */}
         {totalSlices > 1 && (
-          <div className="control-row" style={!isPreview ? { borderTop: '1px solid var(--color-border-subtle)', paddingTop: '0.75rem' } : {}}>
+          <div
+            className="control-row"
+            style={!isPreview ? { borderTop: '1px solid var(--border-subtle)', paddingTop: '0.75rem' } : {}}
+          >
             <div className="control-label">
-              <Eye size={16} />
-              <span>Axial Slice ({currentSliceIdx + 1} of {totalSlices})</span>
+              <Eye size={15} strokeWidth={1.8} aria-hidden="true" />
+              <span>
+                Axial Slice ({currentSliceIdx + 1} of {totalSlices})
+              </span>
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1, maxWidth: 340 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.625rem', flex: 1, maxWidth: 420 }}>
+              {/* Play/Pause Cine Loop */}
               <button
                 type="button"
-                className="nav-btn"
-                onClick={handlePrevSlice}
-                disabled={currentSliceIdx === 0}
-                title="Previous Slice"
+                className="btn-icon"
+                onClick={() => setIsPlayingCine(!isPlayingCine)}
+                title={isPlayingCine ? 'Pause Cine Loop' : 'Play 3D Cine Loop'}
+                aria-label={isPlayingCine ? 'Pause slice animation' : 'Play cine slice sequence'}
               >
-                <ChevronLeft size={18} />
+                {isPlayingCine ? (
+                  <Pause size={14} strokeWidth={2} aria-hidden="true" />
+                ) : (
+                  <Play size={14} fill="currentColor" strokeWidth={1.8} aria-hidden="true" />
+                )}
               </button>
 
+              {/* Prev Slice */}
+              <button
+                type="button"
+                className="btn-icon"
+                onClick={handlePrevSlice}
+                disabled={currentSliceIdx === 0}
+                title="Previous Axial Slice (Left Arrow)"
+                aria-label="Go to previous axial CT slice"
+              >
+                <ChevronLeft size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+
+              {/* Slice Range Scrubber */}
               <input
                 type="range"
                 min="0"
                 max={totalSlices - 1}
                 step="1"
                 value={currentSliceIdx}
-                onChange={(e) => setCurrentSliceIdx(parseInt(e.target.value, 10))}
-                className="custom-range"
+                onChange={(e) => {
+                  setIsPlayingCine(false);
+                  setCurrentSliceIdx(parseInt(e.target.value, 10));
+                }}
+                className="apple-range"
+                aria-label="Navigate through axial CT slices"
+                aria-valuemin={1}
+                aria-valuemax={totalSlices}
+                aria-valuenow={currentSliceIdx + 1}
               />
 
+              {/* Next Slice */}
               <button
                 type="button"
-                className="nav-btn"
+                className="btn-icon"
                 onClick={handleNextSlice}
                 disabled={currentSliceIdx === totalSlices - 1}
-                title="Next Slice"
+                title="Next Axial Slice (Right Arrow)"
+                aria-label="Go to next axial CT slice"
               >
-                <ChevronRight size={18} />
+                <ChevronRight size={16} strokeWidth={2} aria-hidden="true" />
               </button>
+
+              <span className="slider-val-badge tabular-nums">
+                {currentSliceIdx + 1}/{totalSlices}
+              </span>
             </div>
           </div>
         )}
       </div>
-    </div>
+    </section>
   );
 }
