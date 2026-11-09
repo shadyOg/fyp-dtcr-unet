@@ -39,24 +39,38 @@ def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int, max_weig
 
 
 class DualTaskConsistencyLoss(nn.Module):
-    """Dual-Task Consistency Regularization Loss L_DTC."""
+    """Dual-Task Consistency Regularization Loss L_DTC.
 
-    def __init__(self, lambda1: float = 1.0, lambda2: float = 1.0):
+    Implements:
+    - Main Consistency Loss L_main: ||f1(x) - T^{-1}(f2(x))||^2 (Eq. 5)
+    - Gradient Consistency Loss L_grad: ||nabla f1(x) - nabla T^{-1}(f2(x))||^2 (Eq. 6)
+    - Interaction Enhancement Loss L_interact: ||f1(x) * f2(x)|| (Eq. 7)
+    - Context-guided Loss L_context: ||nabla f2(x) - nabla(f1(x) * W(x))||^2 (Eq. 3, Fig. 1)
+    """
+
+    def __init__(
+        self,
+        lambda1: float = 0.3,
+        lambda2: float = 1.0,
+        lambda_context: float = 0.0,
+    ):
         """
         Args:
-            lambda1: Weight for gradient consistency term L_grad (default: 1.0 per Section 4.6).
+            lambda1: Weight for gradient consistency term L_grad (optimal: 0.3 per paper Fig. 7).
             lambda2: Weight for interaction enhancement term L_interact (default: 1.0 per Section 4.6).
+            lambda_context: Weight for context-guided loss L_context (default: 0.0 matching Eq. 4 & Section 4.6).
         """
         super().__init__()
         self.lambda1 = lambda1
         self.lambda2 = lambda2
+        self.lambda_context = lambda_context
 
     def forward(
         self,
         f1_prob: torch.Tensor,
         f2_lsf: torch.Tensor,
         f2_trans: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, dict]:
         """
         Args:
             f1_prob: Segmentation probability map f1(x) = sigmoid(logits) of shape (B, 1, H, W).
@@ -64,7 +78,7 @@ class DualTaskConsistencyLoss(nn.Module):
             f2_trans: Inversely transformed map T^{-1}(f2(x)) of shape (B, 1, H, W).
 
         Returns:
-            L_DTC scalar loss.
+            Tuple of (L_DTC scalar loss, dictionary of individual consistency losses).
         """
         # 1. Main Consistency Loss L_main: ||f1(x) - T^{-1}(f2(x))||^2 (Eq. 5)
         l_main = F.mse_loss(f1_prob, f2_trans)
@@ -75,13 +89,35 @@ class DualTaskConsistencyLoss(nn.Module):
         l_grad = F.mse_loss(f1_gx, t_gx) + F.mse_loss(f1_gy, t_gy)
 
         # 3. Interaction Enhancement Loss L_interact: ||f1(x) * f2(x)|| (Eq. 7)
-        # Penalizes task 1 segmentation predictions where task 2 level set indicates background (f2 > 0)
-        f2_pos = torch.clamp(f2_lsf, min=0.0)
-        l_interact = (f1_prob * f2_pos).mean()
+        # Symmetrically penalizes task discrepancy:
+        # - False positives where Task 1 predicts lesion but Level Set indicates background (f2 > 0)
+        # - False negatives where Task 1 misses lesion but Level Set indicates lesion (f2 < 0)
+        # Correctly aligned predictions receive zero penalty.
+        f2_clamped = f2_lsf.clamp(-1.0, 1.0)
+        interaction_fp = f1_prob * torch.clamp(f2_clamped, min=0.0)
+        interaction_fn = (1.0 - f1_prob) * torch.clamp(-f2_clamped, min=0.0)
+        l_interact = (interaction_fp + interaction_fn).mean()
 
-        # Total L_DTC (Eq. 4)
-        l_dtc = l_main + self.lambda1 * l_grad + self.lambda2 * l_interact
-        return l_dtc
+        # 4. Context-guided Loss L_context per Eq. 3 & Fig. 1 (optional, 0.0 default matching Eq. 4):
+        # Aligns target-weighted segmentation gradients with transformed level-set gradient field
+        if self.lambda_context > 0:
+            w_x = torch.sigmoid(f1_prob * 5.0)
+            target_feat = f1_prob * w_x
+            tf_gx, tf_gy = compute_spatial_gradients(target_feat)
+            l_context = F.mse_loss(t_gx, tf_gx) + F.mse_loss(t_gy, tf_gy)
+        else:
+            l_context = torch.tensor(0.0, device=f1_prob.device)
+
+        # Total L_DTC per Eq. 4 (+ optional context guidance)
+        l_dtc = l_main + self.lambda1 * l_grad + self.lambda2 * l_interact + self.lambda_context * l_context
+
+        loss_breakdown = {
+            "l_main": l_main.item(),
+            "l_grad": l_grad.item(),
+            "l_interact": l_interact.item(),
+            "l_context": l_context.item(),
+        }
+        return l_dtc, loss_breakdown
 
 
 class DTCRTotalLoss(nn.Module):
@@ -89,12 +125,13 @@ class DTCRTotalLoss(nn.Module):
 
     def __init__(
         self,
-        lambda1: float = 1.0,
+        lambda1: float = 0.3,
         lambda2: float = 1.0,
         beta: float = 0.5,
-        bce_weight: float = 0.2,
-        dice_weight: float = 3.0,
-        pos_weight: float = 3.5,
+        bce_weight: float = 0.0,
+        dice_weight: float = 1.0,
+        pos_weight: float = 1.0,
+        lambda_context: float = 0.0,
     ):
         super().__init__()
         from .seg_loss import SupervisedSegLoss
@@ -106,7 +143,11 @@ class DTCRTotalLoss(nn.Module):
             pos_weight=pos_weight,
         )
         self.lsf_criterion = SupervisedLSFLoss(beta=beta)
-        self.dtc_criterion = DualTaskConsistencyLoss(lambda1=lambda1, lambda2=lambda2)
+        self.dtc_criterion = DualTaskConsistencyLoss(
+            lambda1=lambda1,
+            lambda2=lambda2,
+            lambda_context=lambda_context,
+        )
 
     def forward(
         self,
@@ -120,7 +161,7 @@ class DTCRTotalLoss(nn.Module):
         max_epochs: int,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Calculates L_total = L_seg + L_LSF + lambda_d(t) * L_DTC.
+        Calculates L_total = L_seg + L_LSF + lambda_d(t) * L_DTC (Eq. 10).
         Supervised terms apply only to labeled samples (is_labeled == True).
         Consistency term L_DTC applies to ALL samples (labeled + unlabeled).
         """
@@ -139,13 +180,13 @@ class DTCRTotalLoss(nn.Module):
             l_seg = torch.tensor(0.0, device=f1_logits.device)
             l_lsf = torch.tensor(0.0, device=f1_logits.device)
 
-        # 2. Dual-Task Consistency Loss on ALL samples (Eq. 4 & 5)
-        l_dtc = self.dtc_criterion(f1_prob, f2_lsf, f2_trans)
+        # 2. Dual-Task Consistency Loss on ALL samples (Eq. 4-7)
+        l_dtc, dtc_dict = self.dtc_criterion(f1_prob, f2_lsf, f2_trans)
 
-        # 3. Dynamic Weight lambda_d(t) (Eq. 10)
+        # 3. Dynamic Weight lambda_d(t) per Eq. 10
         lambda_d = get_dynamic_consistency_weight(epoch, max_epochs)
 
-        # 4. Total Loss
+        # 4. Total Loss L_total = L_seg + L_LSF + lambda_d * L_DTC (Eq. 10)
         total_loss = l_seg + l_lsf + lambda_d * l_dtc
 
         metrics = {
@@ -154,6 +195,7 @@ class DTCRTotalLoss(nn.Module):
             "loss_lsf": l_lsf.item(),
             "loss_dtc": l_dtc.item(),
             "lambda_d": lambda_d,
+            **dtc_dict,
         }
 
         return total_loss, metrics
