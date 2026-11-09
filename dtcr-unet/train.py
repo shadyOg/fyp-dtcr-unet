@@ -383,7 +383,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Per-step batch size (default: 8)")
     parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4 -> effective batch 32 per paper Section 4.1)")
     parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate (default: 0.001 per paper Section 4.1)")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (default: 1e-4 per paper Section 4.1)")
     parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4 per paper Section 4.2; use 1.0 for fully-supervised)")
+    parser.add_argument("--beta", type=float, default=0.5, help="Gradient constraint weight for supervised LSF loss (default: 0.5 per Section 4.6)")
     parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
@@ -404,7 +406,9 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         labeled_ratio=args.labeled_ratio,
+        beta=args.beta,
         lambda1=args.lambda1,
         lambda2=args.lambda2,
         lambda_context=args.lambda_context,
