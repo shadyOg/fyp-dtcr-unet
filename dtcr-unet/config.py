@@ -12,32 +12,34 @@ class DTCRConfig:
     # Data parameters
     data_dir: str = "data/processed"
     image_size: int = 256
-    context_slices: int = 1       # [-1, 0, +1] adjacent slice context
+    context_slices: int = 2       # 2 adjacent slices above and below (5 slices total) per Section 4.1 line 849
     num_workers: int = 2
-    labeled_ratio: float = 0.4    # 40% labeled, 60% unlabeled for semi-supervised training
+    labeled_ratio: float = 0.4    # 40% labeled, 60% unlabeled for semi-supervised training per Section 4.2
 
-    # Training parameters
-    epochs: int = 80
-    batch_size: int = 16          # 16 or 32 depending on GPU VRAM
-    lr: float = 5e-4              # Initial learning rate
+    # Training parameters (Section 4.1)
+    epochs: int = 80              # 80 epochs per paper Section 4.1
+    batch_size: int = 32          # Batch size 32 per paper Section 4.1
+    lr: float = 0.001             # Initial learning rate 0.001 per paper Section 4.1
     weight_decay: float = 1e-4    # AdamW weight decay
     min_lr: float = 1e-6          # Cosine Annealing minimum learning rate
 
-    # Loss hyperparameters (Section 4.6 & Eq. 8)
-    beta: float = 0.5             # Gradient constraint weight for Supervised LSF loss
-    lambda1: float = 0.3          # Gradient consistency weight for Dual-Task Consistency loss (optimal per paper Fig.7)
-    lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss
-    lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter
-    bce_weight: float = 0.2       # Background BCE weight (reduced to avoid severe lesion suppression)
-    dice_weight: float = 3.0      # Soft Dice weight (Eq. 8 primary objective)
-    pos_weight: float = 3.5       # Positive lesion pixel weighting in BCE
+    # Loss hyperparameters (Section 3.1, Section 4.6 & Fig. 7)
+    beta: float = 0.5             # Gradient constraint weight for Supervised LSF loss (Section 4.6)
+    lambda1: float = 0.3          # Gradient consistency weight for Dual-Task Consistency loss (optimal per Fig. 7)
+    lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss (Section 4.6)
+    lambda_context: float = 0.0   # Context-guided loss weight (0.0 matching Eq. 4 & Section 4.6)
+    lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter (Fig. 7)
+    bce_weight: float = 0.0       # BCE weight (0.0 for pure Dice matching Eq. 8 & 10)
+    dice_weight: float = 1.0      # Soft Dice weight (Eq. 8 primary objective)
+    pos_weight: float = 1.0       # Positive lesion pixel weighting if BCE is used
     fuse_val: bool = True         # Dual-task prediction fusion during validation
-    val_threshold: float = 0.40   # Validation binarization threshold
+    val_threshold: float = 0.50   # Standard binarization threshold (Section 4.3)
 
-    # Model architecture
+    # Model architecture (Table 1: 18.65M parameters)
     in_channels: int = 1
     n_classes: int = 1
     base_channels: int = 64
+    num_stages: int = 4           # 4-stage encoder / 3-stage decoder (18.65M params per Table 1)
     bilinear: bool = False
 
     # Output & Checkpoint paths
