@@ -22,7 +22,7 @@ class DiceLoss(nn.Module):
             pred: Predicted probabilities or sigmoid outputs of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        pred_safe = torch.clamp(pred, min=1e-4, max=1.0 - 1e-4)
+        pred_safe = torch.clamp(pred, min=0.0, max=1.0)
         pred_flat = pred_safe.contiguous().view(pred_safe.size(0), -1)
         target_flat = target.contiguous().view(target.size(0), -1)
 
@@ -51,14 +51,18 @@ class FocalLoss(nn.Module):
 
 
 class SupervisedSegLoss(nn.Module):
-    """Segmentation Loss combining Binary Cross-Entropy and Dice Loss per Eq. 8 of paper."""
+    """Supervised Segmentation Loss matching Eq. 8 of the DTCR-U-Net paper.
+
+    Primary objective is Soft Dice Loss per Eq. 8 with weight 1.0.
+    Optionally allows combining with BCE/Focal loss if requested.
+    """
 
     def __init__(
         self,
-        bce_weight: float = 0.2,
-        dice_weight: float = 3.0,
+        bce_weight: float = 0.0,
+        dice_weight: float = 1.0,
         smooth: float = 1.0,
-        pos_weight: float = 3.5,
+        pos_weight: float = 1.0,
         use_focal: bool = False,
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
@@ -78,16 +82,18 @@ class SupervisedSegLoss(nn.Module):
             logits: Unnormalized logits from segmentation head f1(x) of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        if self.use_focal:
-            bce = self.focal_loss(logits, target)
-        else:
-            if self.pw.item() != 1.0:
-                pw = self.pw.to(device=logits.device, dtype=logits.dtype)
-                bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
-            else:
-                bce = F.binary_cross_entropy_with_logits(logits, target)
-
         probs = torch.sigmoid(logits)
         dice = self.dice_loss(probs, target)
 
-        return self.bce_weight * bce + self.dice_weight * dice
+        if self.bce_weight > 0:
+            if self.use_focal:
+                bce = self.focal_loss(logits, target)
+            else:
+                if self.pw.item() != 1.0:
+                    pw = self.pw.to(device=logits.device, dtype=logits.dtype)
+                    bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
+                else:
+                    bce = F.binary_cross_entropy_with_logits(logits, target)
+            return self.bce_weight * bce + self.dice_weight * dice
+
+        return self.dice_weight * dice
