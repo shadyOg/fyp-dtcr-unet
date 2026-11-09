@@ -156,7 +156,7 @@ def process_mosmed_dataset(
     mosmed_root: str,
     output_dir: str,
     target_size: Tuple[int, int] = (256, 256),
-    context_slices: int = 1,
+    context_slices: int = 2,
     test_ratio: float = 0.2,
     val_ratio: float = 0.2,
     labeled_ratio: float = 1.0,
@@ -392,7 +392,7 @@ def process_covid19_dataset(
     covid_root: str,
     output_dir: str,
     target_size: Tuple[int, int] = (256, 256),
-    context_slices: int = 1,
+    context_slices: int = 2,
     test_ratio: float = 0.2,
     val_ratio: float = 0.2,
     labeled_ratio: float = 0.4,
@@ -688,7 +688,7 @@ def process_lidc_dataset(
     output_dir: str,
     target_size: Tuple[int, int] = (256, 256),
     max_patients: int = 100,
-    context_slices: int = 1,
+    context_slices: int = 2,
     test_ratio: float = 0.2,
     val_ratio: float = 0.2,
     labeled_ratio: float = 1.0,
@@ -921,7 +921,7 @@ def main():
     parser.add_argument("--covid19", default=None, help="Path to COVID-19-CT-Seg dataset directory (e.g. /kaggle/input/covid19-ct-scans)")
     parser.add_argument("--out", default="data/processed", help="Output directory for processed .npy files")
     parser.add_argument("--size", type=int, default=256, help="Target image size (e.g. 256 for 256x256)")
-    parser.add_argument("--context", type=int, default=1, help="Number of adjacent context slices (+/-)")
+    parser.add_argument("--context", type=int, default=2, help="Number of adjacent context slices (+/-) per Section 4.1 (default: 2)")
     parser.add_argument("--labeled-ratio", type=float, default=1.0, help="Fraction of labeled samples (0.4 for semi-supervised)")
     parser.add_argument("--max-patients", type=int, default=100, help="Max LIDC patients to process (default: 100)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
