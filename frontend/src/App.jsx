@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Header from './components/Header';
 import FileUpload from './components/FileUpload';
 import RadiologyViewer from './components/RadiologyViewer';
@@ -15,7 +15,7 @@ export default function App() {
   const [isServerReady, setIsServerReady] = useState(false);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
 
-  // Check backend health on load
+  // Check backend engine health periodically
   useEffect(() => {
     const checkHealth = async () => {
       try {
@@ -35,12 +35,18 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  const handleFileSelected = async (file) => {
+  // Ingest scan file and retrieve immediate preview & metadata
+  const handleFileSelected = useCallback(async (file) => {
     setSelectedFile(file);
     setError(null);
     setAnalysisData(null);
 
     if (!file) return;
+
+    if (file.size === 0) {
+      setError('The selected file is empty (0 bytes). Please upload a valid CT scan image or volumetric series.');
+      return;
+    }
 
     try {
       const formData = new FormData();
@@ -52,14 +58,23 @@ export default function App() {
       const json = await res.json();
       if (res.ok && json.success) {
         setAnalysisData(json.data);
+      } else {
+        setError(json.error || 'Failed to parse CT scan preview. Please verify file format.');
       }
     } catch (err) {
       console.error('Preview load error:', err);
+      setError('Unable to connect to the DTCR-U-Net preview engine. Please verify backend service.');
     }
-  };
+  }, []);
 
-  const handleAnalyze = async () => {
+  // Execute DTCR-U-Net dual-task inference
+  const handleAnalyze = useCallback(async () => {
     if (!selectedFile) return;
+
+    if (selectedFile.size === 0) {
+      setError('Cannot analyze an empty file (0 bytes). Please upload a valid CT scan.');
+      return;
+    }
 
     try {
       setIsAnalyzing(true);
@@ -88,9 +103,10 @@ export default function App() {
     } finally {
       setIsAnalyzing(false);
     }
-  };
+  }, [selectedFile]);
 
-  const handleUploadGroundTruth = async (maskFile) => {
+  // Upload and compare clinician ground truth mask
+  const handleUploadGroundTruth = useCallback(async (maskFile) => {
     if (!maskFile || !analysisData) return;
 
     try {
@@ -119,7 +135,7 @@ export default function App() {
     } finally {
       setIsComparingGt(false);
     }
-  };
+  }, [analysisData]);
 
   return (
     <div className="app-container">
@@ -133,7 +149,7 @@ export default function App() {
       {/* Main Workstation Dashboard */}
       <main className="dashboard-grid">
         {/* Left Section: File Upload & Synchronized Canvas Viewer */}
-        <div className="viewer-panel">
+        <section className="viewer-panel" aria-label="Radiology Viewer Section">
           <FileUpload
             onFileSelected={handleFileSelected}
             selectedFile={selectedFile}
@@ -151,26 +167,29 @@ export default function App() {
               isAnalyzing={isAnalyzing}
             />
           )}
-        </div>
+        </section>
 
-        {/* Right Section: Clinical Summary & Actionable Findings */}
-        <aside className="clinical-panel">
-          <ClinicalCard
-            analysisData={analysisData}
-            onOpenReportModal={() => setIsReportModalOpen(true)}
-            onAnalyze={handleAnalyze}
-            isAnalyzing={isAnalyzing}
-          />
-        </aside>
+        {/* Right Section: Clinical Summary & Actionable Volumetry */}
+        <ClinicalCard
+          analysisData={analysisData}
+          onOpenReportModal={() => setIsReportModalOpen(true)}
+          onAnalyze={handleAnalyze}
+          isAnalyzing={isAnalyzing}
+        />
       </main>
 
-      {/* Medical PDF Diagnostic Report Modal */}
+      {/* Medical PDF Diagnostic Report Modal Sheet */}
       <ReportModal
         isOpen={isReportModalOpen}
         onClose={() => setIsReportModalOpen(false)}
         analysisData={analysisData}
         initialPatientId={patientId}
       />
+
+      {/* Workstation System Footer */}
+      <footer className="workstation-footer">
+        DTCR-U-Net Clinical Workstation • Dual-Task Consistency & Multi-Scale Attention AI • Version 2.0 (Clinical Release)
+      </footer>
     </div>
   );
 }
