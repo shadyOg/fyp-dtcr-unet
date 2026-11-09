@@ -29,20 +29,34 @@ def evaluate_checkpoint(
     save_visualizations: int = 10,
     threshold: float = 0.5,
     fuse_dual_task: bool = False,
+    save_predictions: bool = False,
+    num_stages: Optional[int] = None,
 ):
     """Load model checkpoint and run comprehensive test set evaluation."""
     dev = torch.device(device)
     os.makedirs(output_dir, exist_ok=True)
     comparisons_dir = os.path.join(output_dir, "comparisons")
     os.makedirs(comparisons_dir, exist_ok=True)
+    if save_predictions:
+        preds_dir = os.path.join(output_dir, "predictions")
+        os.makedirs(preds_dir, exist_ok=True)
 
     print(f"Loading checkpoint from: {checkpoint_path}")
     print(f"Evaluation settings: Threshold={threshold} | Dual-Task Fusion={fuse_dual_task}")
     checkpoint = torch.load(checkpoint_path, map_location=dev)
+    state_dict = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint))
 
-    # Initialize model
-    model = DTCR_UNet(in_channels=1, n_classes=1).to(dev)
-    model.load_state_dict(checkpoint["model_state"])
+    # Auto-detect number of stages if not explicitly specified
+    if num_stages is None:
+        cfg = checkpoint.get("config", {})
+        if isinstance(cfg, dict) and "num_stages" in cfg:
+            num_stages = cfg["num_stages"]
+        else:
+            num_stages = 5 if any("down4" in k for k in state_dict.keys()) else 4
+
+    print(f"Model architecture: {num_stages}-stage DTCR-U-Net")
+    model = DTCR_UNet(in_channels=1, n_classes=1, num_stages=num_stages).to(dev)
+    model.load_state_dict(state_dict)
     model.eval()
 
     _, _, test_loader = get_dataloaders(data_dir=data_dir, batch_size=batch_size)
@@ -78,6 +92,11 @@ def evaluate_checkpoint(
 
                 pid = patient_ids[i] if isinstance(patient_ids, (list, tuple)) else str(patient_ids)
                 patient_slices.setdefault(pid, []).append((probs[i, 0], masks[i, 0]))
+
+                if save_predictions:
+                    pred_bin = (probs[i, 0] > threshold).astype(np.uint8)
+                    stem_name = batch.get("stem", [f"slice_{batch_idx}_{i}"])[i]
+                    np.save(os.path.join(preds_dir, f"{stem_name}_pred.npy"), pred_bin)
 
                 # Save qualitative visual comparisons
                 if saved_vis_count < save_visualizations and masks[i, 0].sum() > 0:
@@ -211,6 +230,8 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold (default: 0.5)")
     parser.add_argument("--fuse-dual-task", action="store_true", help="Ensemble Task 1 (Dice head) and Task 2 (Level Set inverse mapping)")
     parser.add_argument("--save-vis", type=int, default=20, help="Number of qualitative comparisons to save (0 to disable)")
+    parser.add_argument("--save-predictions", action="store_true", help="Save binary prediction masks as .npy files")
+    parser.add_argument("--num-stages", type=int, default=None, help="Force number of stages (4 or 5), or None for auto-detect")
     args = parser.parse_args()
 
     evaluate_checkpoint(
@@ -221,6 +242,8 @@ def main():
         save_visualizations=args.save_vis,
         threshold=args.threshold,
         fuse_dual_task=args.fuse_dual_task,
+        save_predictions=args.save_predictions,
+        num_stages=args.num_stages,
     )
 
 
