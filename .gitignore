@@ -49,3 +49,5 @@ credentials.json
 node_modules/
 frontend/node_modules/
 frontend/dist/
+.agents/
+skills-lock.json
