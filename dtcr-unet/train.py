@@ -139,7 +139,7 @@ def evaluate_dataset(
     device: torch.device,
     criterion: Optional[torch.nn.Module] = None,
     use_amp: bool = True,
-    fuse_val: bool = True,
+    fuse_val: bool = False,
     threshold: float = 0.50,
 ) -> dict:
     """Evaluate model on validation or test set, computing overall, lesion-only, and validation loss metrics."""
@@ -147,6 +147,9 @@ def evaluate_dataset(
     all_metrics = []
     lesion_metrics = []
     val_losses = []
+    max_probs = []
+    fg_probs = []
+    bg_probs = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Evaluating]", leave=False):
@@ -177,6 +180,17 @@ def evaluate_dataset(
                     fused_probs = f1_probs
                 probs = fused_probs.float().cpu().numpy()
 
+            # Track probability distribution for transparent diagnostic observability
+            p_cpu = f1_probs.float().cpu()
+            m_cpu = masks.cpu()
+            max_probs.append(p_cpu.max().item())
+            fg_mask = (m_cpu > 0.5)
+            if fg_mask.any():
+                fg_probs.append(p_cpu[fg_mask].mean().item())
+            bg_mask = ~fg_mask
+            if bg_mask.any():
+                bg_probs.append(p_cpu[bg_mask].mean().item())
+
             masks_np = masks.cpu().numpy()
             for i in range(len(probs)):
                 m = compute_binary_metrics(probs[i, 0], masks_np[i, 0], threshold=threshold)
@@ -200,6 +214,10 @@ def evaluate_dataset(
         mean_metrics["val_loss"] = float(np.mean(val_losses))
     else:
         mean_metrics["val_loss"] = 0.0
+
+    mean_metrics["max_prob"] = float(np.max(max_probs)) if max_probs else 0.0
+    mean_metrics["mean_fg_prob"] = float(np.mean(fg_probs)) if fg_probs else 0.0
+    mean_metrics["mean_bg_prob"] = float(np.mean(bg_probs)) if bg_probs else 0.0
 
     return mean_metrics
 
@@ -334,6 +352,8 @@ def train(
             skipped_info = f" | Skipped: {train_losses['_skipped_batches']} batches"
 
         current_lr = optimizer.param_groups[0]["lr"]
+        p_fg = val_metrics.get("mean_fg_prob", 0.0)
+        p_max = val_metrics.get("max_prob", 0.0)
         print(
             f"Epoch {epoch + 1:02d}/{cfg.epochs} ({elapsed:.1f}s) | "
             f"LR: {current_lr:.2e} | "
@@ -343,8 +363,7 @@ def train(
             f"Val SE: {val_metrics['sensitivity']:.2f}% | "
             f"Val SP: {val_metrics['specificity']:.2f}% | "
             f"Val Acc: {val_metrics['accuracy']:.2f}% | "
-            f"Val F1: {val_metrics['f1']:.2f}% | "
-            f"Val HD: {val_metrics['hd']:.2f}px"
+            f"p_fg: {p_fg:.3f} | p_max: {p_max:.3f}"
             f"{' | (Best Val Loss!)' if is_best else ''}"
             f"{skipped_info}"
         )
@@ -389,12 +408,13 @@ def main():
     parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
-    parser.add_argument("--bce-weight", type=float, default=0.0, help="BCE loss weight (default: 0.0 for pure Dice per Eq. 8 & 10)")
+    parser.add_argument("--bce-weight", type=float, default=0.5, help="BCE loss weight (default: 0.5 for stable compound loss; 0.0 for pure Dice)")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight (default: 1.0 matching Eq. 8 & 10)")
     parser.add_argument("--pos-weight", type=float, default=1.0, help="Positive class weight if BCE is enabled (default: 1.0)")
     parser.add_argument("--val-threshold", type=float, default=0.50, help="Validation binarization threshold (default: 0.50)")
     parser.add_argument("--num-stages", type=int, default=4, help="Encoder stages: 4 (18.65M params matching Table 1) or 5 (legacy)")
-    parser.add_argument("--no-fuse-val", action="store_true", help="Disable dual-task prediction fusion during validation")
+    parser.add_argument("--fuse-val", action="store_true", default=False, help="Enable dual-task prediction fusion during validation (default: False, single forward pass f1 per Section 4.1)")
+    parser.add_argument("--no-fuse-val", action="store_true", help="Explicitly disable dual-task prediction fusion during validation")
     parser.add_argument("--no-filter-val", action="store_true", help="Include empty background slices in validation")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
     parser.add_argument("--checkpoints", default="checkpoints", help="Directory to save checkpoints")
@@ -416,7 +436,7 @@ def main():
         dice_weight=args.dice_weight,
         pos_weight=args.pos_weight,
         num_stages=args.num_stages,
-        fuse_val=not args.no_fuse_val,
+        fuse_val=args.fuse_val and not args.no_fuse_val,
         val_threshold=args.val_threshold,
         checkpoint_dir=args.checkpoints,
         output_dir=args.outputs,

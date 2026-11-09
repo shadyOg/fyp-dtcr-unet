@@ -29,10 +29,10 @@ class DTCRConfig:
     lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss (Section 4.6)
     lambda_context: float = 0.0   # Context-guided loss weight (0.0 matching Eq. 4 & Section 4.6)
     lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter (Fig. 7)
-    bce_weight: float = 0.0       # BCE weight (0.0 for pure Dice matching Eq. 8 & 10)
+    bce_weight: float = 0.5       # BCE loss weight (0.5 compound loss prevents class imbalance collapse; 0.0 for pure Dice)
     dice_weight: float = 1.0      # Soft Dice weight (Eq. 8 primary objective)
     pos_weight: float = 1.0       # Positive lesion pixel weighting if BCE is used
-    fuse_val: bool = True         # Dual-task prediction fusion during validation
+    fuse_val: bool = False        # Primary segmentation head f1 inference (single forward pass per Section 4.1)
     val_threshold: float = 0.50   # Standard binarization threshold (Section 4.3)
 
     # Model architecture (Table 1: 18.65M parameters)
