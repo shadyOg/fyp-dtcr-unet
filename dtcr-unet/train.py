@@ -140,7 +140,7 @@ def evaluate_dataset(
     criterion: Optional[torch.nn.Module] = None,
     use_amp: bool = True,
     fuse_val: bool = True,
-    threshold: float = 0.40,
+    threshold: float = 0.50,
 ) -> dict:
     """Evaluate model on validation or test set, computing overall, lesion-only, and validation loss metrics."""
     model.eval()
@@ -231,6 +231,7 @@ def train(
         n_classes=cfg.n_classes,
         bilinear=cfg.bilinear,
         base_c=cfg.base_channels,
+        num_stages=cfg.num_stages,
     ).to(device)
 
     criterion = DTCRTotalLoss(
@@ -240,6 +241,7 @@ def train(
         bce_weight=cfg.bce_weight,
         dice_weight=cfg.dice_weight,
         pos_weight=cfg.pos_weight,
+        lambda_context=cfg.lambda_context,
     ).to(device)
 
     optimizer = optim.AdamW(
@@ -310,12 +312,13 @@ def train(
         lesion_dice = val_metrics.get("lesion_dice", val_dice)
         val_loss = val_metrics.get("val_loss", 0.0)
 
-        # Select best model based on lesion_dice so empty background slices don't distort checkpointing
-        is_best = lesion_dice > best_lesion_dice
+        # Select best model based on lowest validation loss per Section 4.1 line 1245:
+        # "the model checkpoint with the lowest validation loss is selected as the final model."
+        is_best = val_loss < best_val_loss
         if is_best:
-            best_lesion_dice = lesion_dice
-            best_val_dice = val_dice
             best_val_loss = val_loss
+            best_val_dice = val_dice
+            best_lesion_dice = lesion_dice
 
         epoch_log = {
             "epoch": epoch + 1,
@@ -342,7 +345,7 @@ def train(
             f"Val Acc: {val_metrics['accuracy']:.2f}% | "
             f"Val F1: {val_metrics['f1']:.2f}% | "
             f"Val HD: {val_metrics['hd']:.2f}px"
-            f"{' | (Best Lesion!)' if is_best else ''}"
+            f"{' | (Best Val Loss!)' if is_best else ''}"
             f"{skipped_info}"
         )
 
@@ -376,17 +379,19 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Train DTCR-U-Net")
     parser.add_argument("--data", default="data/processed", help="Path to preprocessed dataset")
-    parser.add_argument("--epochs", type=int, default=80, help="Total training epochs (default: 80 per paper)")
+    parser.add_argument("--epochs", type=int, default=80, help="Total training epochs (default: 80 per paper Section 4.1)")
     parser.add_argument("--batch-size", type=int, default=8, help="Per-step batch size (default: 8)")
-    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4 -> effective batch 32 per paper)")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (default: 0.001 per paper)")
-    parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4; use 1.0 for fully-supervised baseline)")
+    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (default: 4 -> effective batch 32 per paper Section 4.1)")
+    parser.add_argument("--lr", type=float, default=0.001, help="Initial learning rate (default: 0.001 per paper Section 4.1)")
+    parser.add_argument("--labeled-ratio", type=float, default=0.4, help="Semi-supervised labeled ratio (default: 0.4 per paper Section 4.2; use 1.0 for fully-supervised)")
     parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
-    parser.add_argument("--bce-weight", type=float, default=0.2, help="BCE loss weight (default: 0.2 to avoid over-suppression)")
-    parser.add_argument("--dice-weight", type=float, default=3.0, help="Dice loss weight (default: 3.0 matching Eq. 8 priority)")
-    parser.add_argument("--pos-weight", type=float, default=3.5, help="Positive class weight in BCE (default: 3.5 for lesion balance)")
-    parser.add_argument("--val-threshold", type=float, default=0.40, help="Validation binarization threshold (default: 0.40)")
+    parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
+    parser.add_argument("--bce-weight", type=float, default=0.0, help="BCE loss weight (default: 0.0 for pure Dice per Eq. 8 & 10)")
+    parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight (default: 1.0 matching Eq. 8 & 10)")
+    parser.add_argument("--pos-weight", type=float, default=1.0, help="Positive class weight if BCE is enabled (default: 1.0)")
+    parser.add_argument("--val-threshold", type=float, default=0.50, help="Validation binarization threshold (default: 0.50)")
+    parser.add_argument("--num-stages", type=int, default=4, help="Encoder stages: 4 (18.65M params matching Table 1) or 5 (legacy)")
     parser.add_argument("--no-fuse-val", action="store_true", help="Disable dual-task prediction fusion during validation")
     parser.add_argument("--no-filter-val", action="store_true", help="Include empty background slices in validation")
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP Mixed Precision")
@@ -402,9 +407,11 @@ def main():
         labeled_ratio=args.labeled_ratio,
         lambda1=args.lambda1,
         lambda2=args.lambda2,
+        lambda_context=args.lambda_context,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
         pos_weight=args.pos_weight,
+        num_stages=args.num_stages,
         fuse_val=not args.no_fuse_val,
         val_threshold=args.val_threshold,
         checkpoint_dir=args.checkpoints,
