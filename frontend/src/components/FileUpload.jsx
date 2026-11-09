@@ -1,7 +1,14 @@
 import React, { useRef, useState } from 'react';
 import { UploadCloud, FileImage, Layers, Play, AlertCircle, RefreshCw } from 'lucide-react';
 
-export default function FileUpload({ onFileSelected, selectedFile, onAnalyze, isAnalyzing, error }) {
+export default function FileUpload({
+  onFileSelected,
+  selectedFile,
+  analysisData,
+  onAnalyze,
+  isAnalyzing,
+  error
+}) {
   const [isDragging, setIsDragging] = useState(false);
   const dragCounter = useRef(0);
   const fileInputRef = useRef(null);
@@ -47,6 +54,7 @@ export default function FileUpload({ onFileSelected, selectedFile, onAnalyze, is
     if (e.target.files && e.target.files.length > 0) {
       onFileSelected(e.target.files[0]);
     }
+    e.target.value = '';
   };
 
   const handleKeyDown = (e) => {
@@ -57,21 +65,64 @@ export default function FileUpload({ onFileSelected, selectedFile, onAnalyze, is
   };
 
   const formatFileSize = (bytes) => {
-    if (bytes === undefined || bytes === null) return '0 B';
+    if (bytes === undefined || bytes === null) return '';
     const numBytes = Number(bytes);
-    if (!isFinite(numBytes) || numBytes <= 0) return '0 B';
+    if (!isFinite(numBytes) || numBytes <= 0) return '';
     const k = 1024;
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
     const i = Math.floor(Math.log(numBytes) / Math.log(k));
     const safeIndex = Math.min(Math.max(0, i), sizes.length - 1);
-    return `${parseFloat((numBytes / Math.pow(k, safeIndex)).toFixed(2))} ${sizes[safeIndex]}`;
+    return `${parseFloat((numBytes / Math.pow(k, safeIndex)).toFixed(1))} ${sizes[safeIndex]}`;
   };
 
-  const isVolumetric = selectedFile?.name?.endsWith('.nii') || selectedFile?.name?.endsWith('.nii.gz');
+  const hasScan = Boolean(selectedFile || analysisData);
+  const fileName = selectedFile?.name || analysisData?.metadata?.filename || 'Loaded CT Series';
+  const isVolumetric =
+    fileName?.toLowerCase().endsWith('.nii') ||
+    fileName?.toLowerCase().endsWith('.nii.gz') ||
+    (analysisData?.total_slices && analysisData.total_slices > 1);
+
+  const getFormatBadge = () => {
+    const lowerName = (fileName || '').toLowerCase();
+    if (lowerName.endsWith('.nii.gz')) return '.NII.GZ';
+    if (lowerName.endsWith('.nii')) return '.NII';
+    if (lowerName.endsWith('.dcm')) return '.DCM';
+    if (lowerName.endsWith('.npy')) return '.NPY';
+    if (lowerName.endsWith('.png')) return '.PNG';
+    if (lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) return '.JPG';
+
+    const fmt = (analysisData?.metadata?.format || '').toLowerCase();
+    if (fmt === 'nifti') return isVolumetric ? '.NII.GZ' : '.NII';
+    if (fmt === 'dicom') return '.DCM';
+    if (fmt === 'numpy') return '.NPY';
+    if (fmt === 'standard_image') {
+      const ext = fileName && fileName.includes('.') ? fileName.split('.').pop().toUpperCase() : '2D';
+      return `.${ext}`;
+    }
+
+    if (fileName && fileName.includes('.')) {
+      return `.${fileName.split('.').pop().toUpperCase()}`;
+    }
+    return 'CT';
+  };
+
+  const totalSlices = analysisData?.total_slices || (isVolumetric ? '3D' : 1);
+  const isPreview = Boolean(analysisData?.is_preview);
+  const isValidCt = analysisData?.is_valid_ct !== false;
+  const fileSizeStr = formatFileSize(selectedFile?.size);
 
   return (
     <section className="upload-container" aria-label="CT Scan File Ingestion">
-      {!selectedFile ? (
+      <input
+        type="file"
+        ref={fileInputRef}
+        onChange={handleInputChange}
+        style={{ display: 'none' }}
+        accept=".png,.jpg,.jpeg,.dcm,.nii,.nii.gz,.npy"
+        tabIndex={-1}
+      />
+
+      {!hasScan ? (
         <div
           className={`upload-zone ${isDragging ? 'dragging' : ''}`}
           onDragEnter={handleDragEnter}
@@ -84,15 +135,6 @@ export default function FileUpload({ onFileSelected, selectedFile, onAnalyze, is
           role="button"
           aria-label="Upload CT Scan Image or Volumetric Dataset. Click or drag and drop."
         >
-          <input
-            type="file"
-            ref={fileInputRef}
-            onChange={handleInputChange}
-            style={{ display: 'none' }}
-            accept=".png,.jpg,.jpeg,.dcm,.nii,.nii.gz,.npy"
-            tabIndex={-1}
-          />
-
           <div className="upload-icon-circle" aria-hidden="true">
             <UploadCloud size={26} strokeWidth={1.8} />
           </div>
@@ -110,58 +152,80 @@ export default function FileUpload({ onFileSelected, selectedFile, onAnalyze, is
           </div>
         </div>
       ) : (
-        <div className="active-file-card">
-          <div className="file-info-group">
-            <div className="file-icon-badge" aria-hidden="true">
-              {isVolumetric ? (
-                <Layers size={20} strokeWidth={1.8} />
-              ) : (
-                <FileImage size={20} strokeWidth={1.8} />
-              )}
+        /* Docked Compact 36px Capsule / Ribbon */
+        <div
+          className={`upload-capsule-docked ${isDragging ? 'dragging' : ''}`}
+          onDragEnter={handleDragEnter}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          role="region"
+          aria-label="Active scan information ribbon"
+        >
+          <div className="capsule-left">
+            <div className="capsule-icon" aria-hidden="true">
+              {isVolumetric ? <Layers size={14} strokeWidth={2} /> : <FileImage size={14} strokeWidth={2} />}
             </div>
-            <div style={{ minWidth: 0 }}>
-              <div className="file-name-text" title={selectedFile.name}>
-                {selectedFile.name}
-              </div>
-              <div className="file-size-text tabular-nums">
-                {formatFileSize(selectedFile.size)} • {isVolumetric ? '3D Volumetric Series' : '2D CT Slice'}
-              </div>
-            </div>
+
+            <span className="capsule-filename" title={fileName}>
+              {fileName}
+            </span>
+
+            <span className="capsule-badge format-badge">
+              {getFormatBadge()}
+            </span>
+
+            <span className="capsule-badge slice-badge tabular-nums">
+              {typeof totalSlices === 'number'
+                ? `${totalSlices} ${totalSlices === 1 ? 'Slice' : 'Slices'}`
+                : totalSlices}
+            </span>
+
+            {fileSizeStr && (
+              <span className="capsule-filesize tabular-nums">
+                {fileSizeStr}
+              </span>
+            )}
           </div>
 
-          <div style={{ display: 'flex', gap: '0.625rem', alignItems: 'center', flexShrink: 0 }}>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => {
-                onFileSelected(null);
-                if (fileInputRef.current) fileInputRef.current.value = '';
-              }}
-              disabled={isAnalyzing}
-              aria-label="Change current scan file"
-            >
-              <RefreshCw size={14} strokeWidth={1.8} />
-              <span>Change File</span>
-            </button>
+          <div className="capsule-right">
+            {isPreview && isValidCt && (
+              <button
+                type="button"
+                className="btn-capsule-analyze"
+                onClick={onAnalyze}
+                disabled={isAnalyzing}
+                aria-label="Execute AI lesion inference on loaded scan"
+              >
+                {isAnalyzing ? (
+                  <>
+                    <div className="spinner" style={{ width: 11, height: 11, borderWidth: 1.5 }} aria-hidden="true" />
+                    <span>Analyzing...</span>
+                  </>
+                ) : (
+                  <>
+                    <Play size={11} fill="currentColor" strokeWidth={2} aria-hidden="true" />
+                    <span>Analyze</span>
+                  </>
+                )}
+              </button>
+            )}
 
             <button
               type="button"
-              className="btn-primary"
-              onClick={onAnalyze}
+              className="btn-capsule-change"
+              onClick={() => {
+                if (fileInputRef.current) {
+                  fileInputRef.current.value = '';
+                  fileInputRef.current.click();
+                }
+              }}
               disabled={isAnalyzing}
-              aria-label="Run AI lesion analysis on this CT scan"
+              aria-label="Change current CT scan file"
+              title="Select or drop a different scan file"
             >
-              {isAnalyzing ? (
-                <>
-                  <div className="spinner" aria-hidden="true" />
-                  <span>Processing...</span>
-                </>
-              ) : (
-                <>
-                  <Play size={14} fill="currentColor" strokeWidth={1.8} aria-hidden="true" />
-                  <span>Analyze Scan</span>
-                </>
-              )}
+              <RefreshCw size={12} strokeWidth={1.8} aria-hidden="true" />
+              <span>Change Scan</span>
             </button>
           </div>
         </div>
@@ -171,19 +235,19 @@ export default function FileUpload({ onFileSelected, selectedFile, onAnalyze, is
         <div
           role="alert"
           style={{
-            padding: '0.75rem 1rem',
+            padding: '0.625rem 0.875rem',
             background: 'var(--color-status-severe-bg)',
             border: '1px solid var(--color-status-severe-border)',
             borderRadius: 'var(--radius-card)',
             color: 'var(--color-status-severe)',
-            fontSize: 'var(--text-sm)',
+            fontSize: 'var(--text-xs)',
             display: 'flex',
             alignItems: 'center',
-            gap: '0.625rem',
+            gap: '0.5rem',
             boxShadow: 'var(--shadow-sm)'
           }}
         >
-          <AlertCircle size={18} strokeWidth={2} style={{ flexShrink: 0 }} aria-hidden="true" />
+          <AlertCircle size={16} strokeWidth={2} style={{ flexShrink: 0 }} aria-hidden="true" />
           <span>{error}</span>
         </div>
       )}

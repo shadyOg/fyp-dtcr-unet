@@ -166,20 +166,6 @@ export default function ClinicalCard({
     ground_truth_filename,
   } = analysisData;
 
-  const renderSeverityIcon = () => {
-    switch (severity_code) {
-      case 'clear':
-        return <ShieldCheck size={22} strokeWidth={2} />;
-      case 'mild':
-        return <Activity size={22} strokeWidth={2} />;
-      case 'moderate':
-        return <AlertTriangle size={22} strokeWidth={2} />;
-      case 'severe':
-      default:
-        return <AlertCircle size={22} strokeWidth={2} />;
-    }
-  };
-
   const formatMetric = (val) => {
     if (val === undefined || val === null) return '0.0';
     const num = Number(val);
@@ -187,26 +173,163 @@ export default function ClinicalCard({
     return num.toFixed(1);
   };
 
+  const involvementNum = Number(overall_involvement_pct) || 0;
+
+  // Apple Semantic Color Mapping
+  const getSeverityColor = () => {
+    switch (severity_code) {
+      case 'clear':
+        return '#30D158'; // System Green
+      case 'mild':
+        return '#64D2FF'; // System Cyan
+      case 'moderate':
+        return '#FF9F0A'; // System Orange
+      case 'severe':
+      default:
+        return '#FF453A'; // System Red
+    }
+  };
+
+  const renderSeverityIcon = () => {
+    switch (severity_code) {
+      case 'clear':
+        return <ShieldCheck size={18} strokeWidth={2.2} color="#30D158" />;
+      case 'mild':
+        return <Activity size={18} strokeWidth={2.2} color="#64D2FF" />;
+      case 'moderate':
+        return <AlertTriangle size={18} strokeWidth={2.2} color="#FF9F0A" />;
+      case 'severe':
+      default:
+        return <AlertCircle size={18} strokeWidth={2.2} color="#FF453A" />;
+    }
+  };
+
+  // Radial gauge geometry (r = 46, circumference ~289.03)
+  const radius = 46;
+  const circumference = 2 * Math.PI * radius;
+  const displayRatio = Math.min(100, Math.max(0, involvementNum)) / 100;
+  const strokeDashoffset = circumference - displayRatio * circumference;
+  const severityColor = getSeverityColor();
+
   const displayAccuracy = ai_accuracy ?? overall_dice;
   const accuracyNum = Number(displayAccuracy) || 0;
   const isHighMatch = accuracyNum >= 70;
+
+  // Segmented threshold definitions aligned with clinical backend classifier
+  const segments = [
+    { id: 'clear', label: 'Clear', range: '<1%', color: '#30D158' },
+    { id: 'mild', label: 'Mild', range: '1-10%', color: '#64D2FF' },
+    { id: 'moderate', label: 'Mod', range: '10-25%', color: '#FF9F0A' },
+    { id: 'severe', label: 'Sev', range: '>25%', color: '#FF453A' },
+  ];
 
   return (
     <aside className="clinical-card" aria-label="Clinical Volumetry and Diagnostic Findings">
       <div className="card-heading">
         <h2 className="card-title">Diagnostic Assessment</h2>
+        <span
+          className="card-ai-badge"
+          style={{
+            fontSize: 'var(--text-xs)',
+            fontWeight: 600,
+            color: 'var(--color-brand-tertiary)',
+            background: 'var(--color-brand-tint)',
+            padding: '0.15rem 0.5rem',
+            borderRadius: 'var(--radius-pill)',
+            border: '1px solid rgba(157, 78, 221, 0.25)',
+          }}
+        >
+          Dual-Task DTCR-U-Net
+        </span>
       </div>
 
-      {/* Severity Status Banner */}
-      <div className={`severity-banner ${severity_code || 'severe'}`} role="status">
-        <div className="severity-icon-badge" aria-hidden="true">
-          {renderSeverityIcon()}
-        </div>
-        <div className="severity-text-group">
-          <h3>{severity || 'Severity Assessment'}</h3>
-          <p className="tabular-nums">
-            {formatMetric(overall_involvement_pct)}% Total Pulmonary Involvement
-          </p>
+      {/* Apple Health-Style Radial & Segmented Severity Gauge */}
+      <div className="radial-gauge-card" role="status" aria-label={`Severity: ${severity}, ${formatMetric(overall_involvement_pct)}% involvement`}>
+        <div className="radial-gauge-top">
+          {/* Circular Animated SVG Gauge */}
+          <div className="radial-gauge-wrapper">
+            <svg
+              className="radial-gauge-svg"
+              width="114"
+              height="114"
+              viewBox="0 0 114 114"
+              aria-hidden="true"
+            >
+              {/* Background Track */}
+              <circle
+                cx="57"
+                cy="57"
+                r={radius}
+                fill="none"
+                stroke="rgba(255, 255, 255, 0.08)"
+                strokeWidth="8"
+              />
+              {/* Active Severity Arc */}
+              <circle
+                cx="57"
+                cy="57"
+                r={radius}
+                fill="none"
+                stroke={severityColor}
+                strokeWidth="8"
+                strokeDasharray={circumference}
+                strokeDashoffset={strokeDashoffset}
+                strokeLinecap={displayRatio > 0 ? "round" : "butt"}
+                opacity={displayRatio > 0 ? 1 : 0}
+                transform="rotate(-90 57 57)"
+                style={{
+                  transition: 'stroke-dashoffset 0.8s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.3s ease',
+                  filter: displayRatio > 0 ? `drop-shadow(0 0 6px ${severityColor}66)` : 'none',
+                }}
+              />
+            </svg>
+
+            {/* Gauge Centered Telemetry */}
+            <div className="radial-gauge-center">
+              <div className="radial-icon" aria-hidden="true">
+                {renderSeverityIcon()}
+              </div>
+              <span className="radial-percentage tabular-nums">
+                {formatMetric(overall_involvement_pct)}%
+              </span>
+              <span className="radial-label">Involvement</span>
+            </div>
+          </div>
+
+          {/* Diagnostic Severity Breakdown */}
+          <div className="radial-details">
+            <div className="radial-severity-title" style={{ color: severityColor }}>
+              {severity || 'Severity Assessment'}
+            </div>
+            <p className="radial-severity-desc">
+              {involvementNum === 0
+                ? 'No visible pulmonary consolidations detected.'
+                : `${formatMetric(overall_involvement_pct)}% of lung parenchyma involved by lesion pathology.`}
+            </p>
+
+            {/* Segmented Spectrum Track */}
+            <div className="severity-spectrum-container" aria-label="Severity spectrum range">
+              <div className="severity-spectrum-bar">
+                {segments.map((seg) => {
+                  const isActive = (severity_code || 'severe') === seg.id;
+                  return (
+                    <div
+                      key={seg.id}
+                      className={`severity-spectrum-segment ${isActive ? 'active' : ''}`}
+                      style={{
+                        backgroundColor: isActive ? seg.color : 'rgba(255, 255, 255, 0.08)',
+                        borderColor: isActive ? seg.color : 'transparent',
+                        boxShadow: isActive ? `0 0 8px ${seg.color}66` : 'none',
+                      }}
+                      title={`${seg.label} Range: ${seg.range}`}
+                    >
+                      <span className="segment-label">{seg.label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
