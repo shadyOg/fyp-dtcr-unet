@@ -150,6 +150,8 @@ def evaluate_dataset(
     max_probs = []
     fg_probs = []
     bg_probs = []
+    soft_dices = []
+    dices_30 = []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="[Evaluating]", leave=False):
@@ -193,10 +195,19 @@ def evaluate_dataset(
 
             masks_np = masks.cpu().numpy()
             for i in range(len(probs)):
-                m = compute_binary_metrics(probs[i, 0], masks_np[i, 0], threshold=threshold)
+                p_i = probs[i, 0]
+                m_i = masks_np[i, 0]
+                m = compute_binary_metrics(p_i, m_i, threshold=threshold)
                 all_metrics.append(m)
-                if masks_np[i, 0].sum() > 0:
+                if m_i.sum() > 0:
                     lesion_metrics.append(m)
+                    # Continuous Soft Dice
+                    inter = np.sum(p_i * m_i)
+                    card = np.sum(p_i) + np.sum(m_i)
+                    soft_dices.append(float((2.0 * inter + 1.0) / (card + 1.0)))
+                    # Dice at soft threshold 0.30
+                    m30 = compute_binary_metrics(p_i, m_i, threshold=0.30)
+                    dices_30.append(m30["dice"])
 
     mean_metrics = {}
     if all_metrics:
@@ -218,6 +229,8 @@ def evaluate_dataset(
     mean_metrics["max_prob"] = float(np.max(max_probs)) if max_probs else 0.0
     mean_metrics["mean_fg_prob"] = float(np.mean(fg_probs)) if fg_probs else 0.0
     mean_metrics["mean_bg_prob"] = float(np.mean(bg_probs)) if bg_probs else 0.0
+    mean_metrics["soft_dice"] = float(np.mean(soft_dices)) if soft_dices else 0.0
+    mean_metrics["dice_at_30"] = float(np.mean(dices_30)) if dices_30 else 0.0
 
     return mean_metrics
 
@@ -260,6 +273,7 @@ def train(
         dice_weight=cfg.dice_weight,
         pos_weight=cfg.pos_weight,
         lambda_context=cfg.lambda_context,
+        use_focal=cfg.use_focal,
     ).to(device)
 
     optimizer = optim.AdamW(
@@ -354,12 +368,16 @@ def train(
         current_lr = optimizer.param_groups[0]["lr"]
         p_fg = val_metrics.get("mean_fg_prob", 0.0)
         p_max = val_metrics.get("max_prob", 0.0)
+        soft_dice = val_metrics.get("soft_dice", 0.0)
+        dice_30 = val_metrics.get("dice_at_30", 0.0)
         print(
             f"Epoch {epoch + 1:02d}/{cfg.epochs} ({elapsed:.1f}s) | "
             f"LR: {current_lr:.2e} | "
             f"Train Loss: {train_losses['total']:.4f} | "
             f"Val Loss: {val_loss:.4f} | "
             f"Val Dice: {val_dice:.2f}% (Lesion: {lesion_dice:.2f}%) | "
+            f"Soft Dice: {soft_dice:.2f}% | "
+            f"D@0.30: {dice_30:.2f}% | "
             f"Val SE: {val_metrics['sensitivity']:.2f}% | "
             f"Val SP: {val_metrics['specificity']:.2f}% | "
             f"Val Acc: {val_metrics['accuracy']:.2f}% | "
@@ -408,9 +426,10 @@ def main():
     parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
-    parser.add_argument("--bce-weight", type=float, default=0.5, help="BCE loss weight (default: 0.5 for stable compound loss; 0.0 for pure Dice)")
+    parser.add_argument("--bce-weight", type=float, default=0.0, help="BCE loss weight (default: 0.0 for pure Soft Dice per Eq. 8; >0 for compound loss)")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight (default: 1.0 matching Eq. 8 & 10)")
-    parser.add_argument("--pos-weight", type=float, default=1.0, help="Positive class weight if BCE is enabled (default: 1.0)")
+    parser.add_argument("--pos-weight", type=float, default=20.0, help="Positive class weight if BCE is enabled (default: 20.0 to balance 99.76% background)")
+    parser.add_argument("--use-focal", action="store_true", default=False, help="Use Focal Loss instead of BCE if bce-weight > 0")
     parser.add_argument("--val-threshold", type=float, default=0.50, help="Validation binarization threshold (default: 0.50)")
     parser.add_argument("--num-stages", type=int, default=4, help="Encoder stages: 4 (18.65M params matching Table 1) or 5 (legacy)")
     parser.add_argument("--fuse-val", action="store_true", default=False, help="Enable dual-task prediction fusion during validation (default: False, single forward pass f1 per Section 4.1)")
@@ -435,6 +454,7 @@ def main():
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
         pos_weight=args.pos_weight,
+        use_focal=args.use_focal,
         num_stages=args.num_stages,
         fuse_val=args.fuse_val and not args.no_fuse_val,
         val_threshold=args.val_threshold,
