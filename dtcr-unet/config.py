@@ -29,6 +29,7 @@ class DTCRConfig:
     lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss (Section 4.6)
     lambda_context: float = 0.0   # Context-guided loss weight (0.0 matching Eq. 4 & Section 4.6)
     lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter (Fig. 7)
+    consistency_weight: float = 0.1 # Maximum weight for dynamic consistency lambda_d(t) (default: 0.1 per DTC AAAI 2021)
     bce_weight: float = 0.0       # BCE loss weight (0.0 for pure Soft Dice per Eq. 8; >0 if compound loss)
     dice_weight: float = 1.0      # Soft Dice weight (Eq. 8 primary objective)
     pos_weight: float = 20.0      # Positive lesion pixel weighting if BCE is used (balances 99.76% background)

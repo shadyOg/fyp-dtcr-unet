@@ -15,6 +15,7 @@ def compute_binary_metrics(
     pred_mask: np.ndarray,
     true_mask: np.ndarray,
     threshold: float = 0.5,
+    compute_hd: bool = False,
 ) -> Dict[str, float]:
     """Compute all evaluation metrics defined in Section 4.3 of the paper.
 
@@ -22,6 +23,7 @@ def compute_binary_metrics(
         pred_mask: Probability map or binary mask (H, W) in [0, 1].
         true_mask: Ground-truth binary mask (H, W) in {0, 1}.
         threshold: Binarization threshold.
+        compute_hd: Whether to compute CPU-intensive Hausdorff distance (skip during fast per-epoch validation).
 
     Returns:
         Dictionary with Dice, Sensitivity, Specificity, Accuracy, F1, and Hausdorff Distance.
@@ -54,7 +56,7 @@ def compute_binary_metrics(
         sp = float(tn / (tn + fp + eps))
         accuracy = float(tn / (tn + fp + eps))
         f1 = 0.0
-        hd = float(np.sqrt(pred_mask.shape[0] ** 2 + pred_mask.shape[1] ** 2))
+        hd = float(np.sqrt(pred_mask.shape[0] ** 2 + pred_mask.shape[1] ** 2)) if compute_hd else 0.0
     elif has_target and not has_pred:
         # Missed lesion completely
         dice = 0.0
@@ -62,7 +64,7 @@ def compute_binary_metrics(
         sp = 1.0
         accuracy = float(tn / (tn + fn + eps))
         f1 = 0.0
-        hd = float(np.sqrt(pred_mask.shape[0] ** 2 + pred_mask.shape[1] ** 2))
+        hd = float(np.sqrt(pred_mask.shape[0] ** 2 + pred_mask.shape[1] ** 2)) if compute_hd else 0.0
     else:
         # Both contain foreground pixels
         se = float(tp / (tp + fn + eps))
@@ -73,11 +75,14 @@ def compute_binary_metrics(
         recall = se
         f1 = float(2.0 * precision * recall / (precision + recall + eps))
 
-        p_pts = np.argwhere(p)
-        t_pts = np.argwhere(t)
-        d_p_t = directed_hausdorff(p_pts, t_pts)[0]
-        d_t_p = directed_hausdorff(t_pts, p_pts)[0]
-        hd = float(max(d_p_t, d_t_p))
+        if compute_hd:
+            p_pts = np.argwhere(p)
+            t_pts = np.argwhere(t)
+            d_p_t = directed_hausdorff(p_pts, t_pts)[0]
+            d_t_p = directed_hausdorff(t_pts, p_pts)[0]
+            hd = float(max(d_p_t, d_t_p))
+        else:
+            hd = 0.0
 
     return {
         "dice": dice * 100.0,

@@ -197,7 +197,7 @@ def evaluate_dataset(
             for i in range(len(probs)):
                 p_i = probs[i, 0]
                 m_i = masks_np[i, 0]
-                m = compute_binary_metrics(p_i, m_i, threshold=threshold)
+                m = compute_binary_metrics(p_i, m_i, threshold=threshold, compute_hd=False)
                 all_metrics.append(m)
                 if m_i.sum() > 0:
                     lesion_metrics.append(m)
@@ -205,8 +205,8 @@ def evaluate_dataset(
                     inter = np.sum(p_i * m_i)
                     card = np.sum(p_i) + np.sum(m_i)
                     soft_dices.append(float((2.0 * inter + 1.0) / (card + 1.0)))
-                    # Dice at soft threshold 0.30
-                    m30 = compute_binary_metrics(p_i, m_i, threshold=0.30)
+                    # Dice at soft threshold 0.30 (fast, no HD on CPU)
+                    m30 = compute_binary_metrics(p_i, m_i, threshold=0.30, compute_hd=False)
                     dices_30.append(m30["dice"])
 
     mean_metrics = {}
@@ -274,6 +274,7 @@ def train(
         pos_weight=cfg.pos_weight,
         lambda_context=cfg.lambda_context,
         use_focal=cfg.use_focal,
+        consistency_weight=cfg.consistency_weight,
     ).to(device)
 
     optimizer = optim.AdamW(
@@ -426,6 +427,7 @@ def main():
     parser.add_argument("--lambda1", type=float, default=0.3, help="Gradient consistency weight for L_DTC (default: 0.3 per paper Fig.7 optimum)")
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
+    parser.add_argument("--consistency-weight", type=float, default=0.1, help="Maximum dynamic consistency weight lambda_d(t) (default: 0.1 per DTC AAAI 2021)")
     parser.add_argument("--bce-weight", type=float, default=0.0, help="BCE loss weight (default: 0.0 for pure Soft Dice per Eq. 8; >0 for compound loss)")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight (default: 1.0 matching Eq. 8 & 10)")
     parser.add_argument("--pos-weight", type=float, default=20.0, help="Positive class weight if BCE is enabled (default: 20.0 to balance 99.76% background)")
@@ -451,6 +453,7 @@ def main():
         lambda1=args.lambda1,
         lambda2=args.lambda2,
         lambda_context=args.lambda_context,
+        consistency_weight=args.consistency_weight,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
         pos_weight=args.pos_weight,
