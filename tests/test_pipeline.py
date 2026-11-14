@@ -96,8 +96,17 @@ def test_covid_pairing_picks_infection_mask():
         assert all(Path(c).parent.name == "ct_scans" for c in cts), cts
 
 
-def _write_lidc_patient(root: Path, patient_id: str, rng: np.random.Generator, with_nodule: bool = True) -> None:
-    """Write one LIDC-style patient: a DICOM CT series plus its XML contour annotation."""
+def _write_lidc_patient(
+    root: Path, patient_id: str, rng: np.random.Generator, with_nodule: bool = True, misplaced: bool = False
+) -> None:
+    """Write one LIDC-style patient: a DICOM CT series plus its XML contour annotation.
+
+    Every contour carries its instance UID and a z position that is off by two
+    slices, so it lands on the nodule only if the UID is used. Each contour also
+    has a small hole (inclusion=FALSE) at its centre. With `misplaced`, the UIDs
+    are left out and the z position is shifted onto lesion-free slices, which the
+    alignment check must flag.
+    """
     import pydicom
     from pydicom.dataset import FileDataset, FileMetaDataset
     from pydicom.uid import CTImageStorage, ExplicitVRLittleEndian, generate_uid
@@ -108,6 +117,7 @@ def _write_lidc_patient(root: Path, patient_id: str, rng: np.random.Generator, w
     series_dir = root / "LIDC-IDRI-0001-0200" / patient_id / "study" / "series"
     series_dir.mkdir(parents=True)
 
+    sop_uids = []
     for z in range(depth):
         meta = FileMetaDataset()
         meta.MediaStorageSOPClassUID = CTImageStorage
@@ -116,6 +126,7 @@ def _write_lidc_patient(root: Path, patient_id: str, rng: np.random.Generator, w
         # File names deliberately run against the z order: slices must be sorted by position.
         ds = FileDataset(str(series_dir / f"{depth - z:03d}.dcm"), {}, file_meta=meta, preamble=bytes(128))
         ds.SOPClassUID, ds.SOPInstanceUID = CTImageStorage, meta.MediaStorageSOPInstanceUID
+        sop_uids.append(str(ds.SOPInstanceUID))
         ds.Modality, ds.PatientID = "CT", patient_id
         ds.StudyInstanceUID, ds.SeriesInstanceUID = study_uid, series_uid
         ds.InstanceNumber = depth - z
@@ -140,8 +151,17 @@ def _write_lidc_patient(root: Path, patient_id: str, rng: np.random.Generator, w
             f"<edgeMap><xCoord>{int(round(cx + radius * np.cos(a)))}</xCoord>"
             f"<yCoord>{int(round(cy + radius * np.sin(a)))}</yCoord></edgeMap>" for a in angles
         )
+        hole = "".join(
+            f"<edgeMap><xCoord>{int(round(cx + 1.5 * np.cos(a)))}</xCoord>"
+            f"<yCoord>{int(round(cy + 1.5 * np.sin(a)))}</yCoord></edgeMap>" for a in angles[::5]
+        )
         for z in np.nonzero(mask.reshape(depth, -1).any(axis=1))[0]:
-            rois += f"<roi><imageZposition>{z0 + dz * z}</imageZposition><inclusion>TRUE</inclusion>{edge}</roi>"
+            if misplaced:
+                tags = f"<imageZposition>{z0 + dz * (z + 5)}</imageZposition>"
+            else:
+                tags = f"<imageZposition>{z0 + dz * (z + 2)}</imageZposition><imageSOP_UID>{sop_uids[z]}</imageSOP_UID>"
+            rois += f"<roi>{tags}<inclusion>TRUE</inclusion>{edge}</roi>"
+            rois += f"<roi>{tags}<inclusion>FALSE</inclusion>{hole}</roi>"
     session = f"<readingSession><unblindedReadNodule><noduleID>1</noduleID>{rois}</unblindedReadNodule></readingSession>"
     xml_dir = root / "LIDC-XML-only" / "tcia-lidc-xml" / "157"
     xml_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +184,8 @@ def test_lidc_processing():
 
         manifest = process_lidc_dataset(str(root), str(out), target_size=(64, 64), max_patients=8, context_slices=2)
         assert sum(manifest["cases"].values()) == 8, manifest          # stops at the requested usable count
+        assert manifest["low_contrast_cases"] == [], manifest["low_contrast_cases"]
+        assert manifest["lesion_contrast_median"] > 0.15
         assert manifest["cases"]["test"] >= 1 and manifest["cases"]["val"] >= 1
         assert not (out / "_lidc_staging").exists()
 
@@ -174,8 +196,18 @@ def test_lidc_processing():
                 n_lesion += 1
                 # The contour must land on the bright blob, i.e. the right slice and the right place
                 assert img[msk > 0].mean() > img[msk == 0].mean() + 0.15, f"mask misses the nodule in {mp.name}"
+                ys, xs = np.nonzero(msk)
+                assert msk[int(round(ys.mean())), int(round(xs.mean()))] == 0, f"hole not subtracted in {mp.name}"
         assert n_lesion == 8 * 4, n_lesion                             # 4 nodule slices per patient
         assert len(list(out.glob("*/masks/lidc_*.npy"))) == 8 * 8      # plus 2 context slices each side
+
+    # Contours placed on the wrong slices must be flagged by the alignment check
+    with tempfile.TemporaryDirectory() as tmp:
+        root, out = Path(tmp) / "lidc", Path(tmp) / "processed"
+        for i in range(1, 6):
+            _write_lidc_patient(root, f"LIDC-IDRI-{i:04d}", rng, misplaced=(i == 3))
+        manifest = process_lidc_dataset(str(root), str(out), target_size=(64, 64), max_patients=5, context_slices=2)
+        assert manifest["low_contrast_cases"] == ["lidc_LIDC-IDRI-0003"], manifest["low_contrast_cases"]
 
 
 def test_end_to_end_pipeline():
@@ -308,7 +340,29 @@ def test_end_to_end_pipeline():
     print("Pipeline tests passed.")
 
 
+def test_dice_modes():
+    """Hybrid Dice gives a missed small lesion real weight next to a large one."""
+    from losses.seg_loss import DiceLoss
+
+    target = torch.zeros(2, 1, 64, 64)
+    target[0, 0, 10:50, 10:50] = 1      # 1600 px lesion, predicted perfectly
+    target[1, 0, 30:33, 30:33] = 1      # 9 px nodule, missed
+    pred = target.clone()
+    pred[1] = 0
+    batch = DiceLoss(mode="batch")(pred, target).item()
+    hybrid = DiceLoss(mode="hybrid")(pred, target).item()
+    assert batch < 0.01, batch            # the missed nodule is almost invisible to pooled Dice
+    assert hybrid > 0.2, hybrid           # ... but costs about a quarter of the loss in hybrid mode
+
+    empty_t = torch.zeros(2, 1, 64, 64)
+    assert DiceLoss(mode="hybrid")(torch.zeros_like(empty_t), empty_t).item() == 0.0
+    fp = torch.zeros_like(empty_t)
+    fp[0, 0, 0, 0] = 1.0                  # one false-positive pixel on an empty batch
+    assert abs(DiceLoss(mode="hybrid")(fp, empty_t).item() - 0.5) < 1e-6  # priced like pooled Dice
+
+
 if __name__ == "__main__":
+    test_dice_modes()
     test_level_set_round_trip()
     test_covid_pairing_picks_infection_mask()
     test_lidc_processing()

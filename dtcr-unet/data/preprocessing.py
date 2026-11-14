@@ -175,6 +175,41 @@ def make_output_dirs(out_path: Path) -> None:
             os.makedirs(out_path / split / sub, exist_ok=True)
 
 
+# A case whose masks barely stand out from their surroundings is probably misaligned.
+LOW_CONTRAST = 0.05
+
+
+def lesion_contrast(img: np.ndarray, mask: np.ndarray, ring_px: int = 4) -> Optional[float]:
+    """Mean intensity inside the mask minus the mean of a thin ring around it.
+
+    Nodules and consolidations are brighter than the lung around them, so a
+    correctly placed mask gives a clearly positive value; a mask shifted off
+    its lesion gives about zero.
+    """
+    from scipy.ndimage import binary_dilation
+
+    m = mask > 0
+    if not m.any():
+        return None
+    ring = binary_dilation(m, iterations=ring_px) & ~m
+    if not ring.any():
+        return None
+    return float(img[m].mean() - img[ring].mean())
+
+
+def contrast_report(contrast_by_case: Dict[str, Optional[float]]) -> Dict:
+    """Manifest entries summarising the mask-alignment check."""
+    vals = {k: v for k, v in contrast_by_case.items() if v is not None}
+    low = sorted(k for k, v in vals.items() if v < LOW_CONTRAST)
+    if low:
+        print(f"  WARNING: {len(low)} case(s) with low lesion contrast (mask possibly misaligned): {low}")
+    return {
+        "lesion_contrast_median": float(np.median(list(vals.values()))) if vals else None,
+        "low_contrast_cases": low,
+        "lesion_contrast_by_case": {k: (None if v is None else round(v, 4)) for k, v in contrast_by_case.items()},
+    }
+
+
 def save_case_slices(
     ct_zyx: np.ndarray,
     mask_zyx: np.ndarray,
@@ -186,10 +221,11 @@ def save_case_slices(
     """Preprocess and save the selected slices of one case.
 
     Returns:
-        (number of slices saved, number of those that contain lesion pixels).
+        (slices saved, slices that contain lesion pixels, median lesion contrast or None).
     """
     is_hu = volume_is_hu(ct_zyx)
     saved, with_lesion = 0, 0
+    contrasts = []
     for idx in slice_indices:
         ct_resized = resize_slice(normalize_ct_slice(ct_zyx[idx], is_hu=is_hu), target_size, is_mask=False)
         mask_resized = resize_slice(mask_zyx[idx], target_size, is_mask=True)
@@ -201,7 +237,10 @@ def save_case_slices(
         np.save(split_dir / "level_sets" / f"{stem}.npy", lsf_map)
         saved += 1
         with_lesion += int(mask_resized.any())
-    return saved, with_lesion
+        c = lesion_contrast(ct_resized, mask_resized)
+        if c is not None:
+            contrasts.append(c)
+    return saved, with_lesion, (float(np.median(contrasts)) if contrasts else None)
 
 
 def _process_nifti_dataset(
@@ -224,6 +263,7 @@ def _process_nifti_dataset(
     counts = {"train": 0, "val": 0, "test": 0}
     lesion_counts = {"train": 0, "val": 0, "test": 0}
     case_counts = {"train": 0, "val": 0, "test": 0}
+    contrast_by_case: Dict[str, Optional[float]] = {}
     skipped = 0
 
     for case_id in tqdm(sorted(pairs.keys()), desc=f"Processing {name}"):
@@ -239,9 +279,10 @@ def _process_nifti_dataset(
             continue
 
         split_name = split_lookup[case_id]
-        saved, with_lesion = save_case_slices(
+        saved, with_lesion, contrast = save_case_slices(
             ct_zyx, mask_zyx, indices, f"{stem_prefix}_{case_id}", out_path / split_name, target_size
         )
+        contrast_by_case[f"{stem_prefix}_{case_id}"] = contrast
         counts[split_name] += saved
         lesion_counts[split_name] += with_lesion
         case_counts[split_name] += 1
@@ -255,6 +296,7 @@ def _process_nifti_dataset(
         "slices_with_lesion": lesion_counts,
         "skipped_cases": skipped,
         "seed": seed,
+        **contrast_report(contrast_by_case),
     }
     with open(out_path / manifest_name, "w") as f:
         json.dump(manifest, f, indent=2)
@@ -449,90 +491,92 @@ def _build_xml_uid_index(xml_root: str) -> Dict[str, str]:
     return uid_map
 
 
+def _local(tag: str) -> str:
+    """XML tag without its namespace."""
+    return tag.split("}")[-1]
+
+
 def _extract_nodule_masks_from_xml(
     xml_path: str,
     ct_origin_z: float,
     ct_spacing_z: float,
     num_slices: int,
     volume_shape: Tuple[int, int],
+    sop_to_index: Optional[Dict[str, int]] = None,
 ) -> np.ndarray:
-    """Parse LIDC XML and convert radiologist nodule contours to a 3D binary mask volume.
+    """Rasterize LIDC radiologist nodule outlines into a 3D binary mask (Z, Y, X).
 
-    Uses majority voting: a voxel is positive if >= 2 radiologists marked it,
-    or >= 1 if only 1 radiologist marked any nodule.
+    - Each contour is placed on its slice through its imageSOP_UID (the DICOM
+      instance it was drawn on) when `sop_to_index` is given; the physical z
+      position is only a fallback.
+    - Contours with inclusion=FALSE outline holes and are subtracted.
+    - Each reading session (reader) votes at most once per voxel; a voxel is
+      lesion when at least 2 readers agree (1 when only one reader outlined anything).
     """
     import xml.etree.ElementTree as ET
     from skimage.draw import polygon
 
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-
-    # Accumulate votes from all reading sessions
-    vote_volume = np.zeros((num_slices, volume_shape[0], volume_shape[1]), dtype=np.int32)
+    root = ET.parse(xml_path).getroot()
+    vote_volume = np.zeros((num_slices, volume_shape[0], volume_shape[1]), dtype=np.int16)
 
     for session in root.iter():
-        session_tag = session.tag.split("}")[-1] if "}" in session.tag else session.tag
-        if session_tag != "readingSession":
+        if _local(session.tag) != "readingSession":
             continue
 
+        include: Dict[int, np.ndarray] = {}
+        exclude: Dict[int, np.ndarray] = {}
         for nodule in session.iter():
-            nodule_tag = nodule.tag.split("}")[-1] if "}" in nodule.tag else nodule.tag
-            if nodule_tag != "unblindedReadNodule":
+            if _local(nodule.tag) != "unblindedReadNodule":
                 continue
-
             for roi in nodule.iter():
-                roi_tag = roi.tag.split("}")[-1] if "}" in roi.tag else roi.tag
-                if roi_tag != "roi":
+                if _local(roi.tag) != "roi":
                     continue
 
-                z_pos = None
-                edges = []
-                for child in roi.iter():
-                    child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                    if child_tag == "imageZposition" and child.text:
+                z_pos, sop_uid, inclusion, edges = None, None, True, []
+                for child in roi:
+                    tag = _local(child.tag)
+                    text = (child.text or "").strip()
+                    if tag == "imageZposition" and text:
                         try:
-                            z_pos = float(child.text)
+                            z_pos = float(text)
                         except ValueError:
                             pass
-                    elif child_tag == "edgeMap":
-                        x, y = None, None
-                        for coord in child.iter():
-                            coord_tag = coord.tag.split("}")[-1] if "}" in coord.tag else coord.tag
-                            if coord_tag == "xCoord" and coord.text:
-                                try:
-                                    x = float(coord.text)
-                                except ValueError:
-                                    pass
-                            elif coord_tag == "yCoord" and coord.text:
-                                try:
-                                    y = float(coord.text)
-                                except ValueError:
-                                    pass
-                        if x is not None and y is not None:
-                            edges.append((x, y))
+                    elif tag == "imageSOP_UID" and text:
+                        sop_uid = text
+                    elif tag == "inclusion" and text:
+                        inclusion = text.upper() != "FALSE"
+                    elif tag == "edgeMap":
+                        coords = {_local(c.tag): c.text for c in child}
+                        try:
+                            edges.append((float(coords["xCoord"]), float(coords["yCoord"])))
+                        except (KeyError, TypeError, ValueError):
+                            pass
 
-                if z_pos is None or len(edges) < 3:
+                if len(edges) < 3:  # nodules < 3 mm are marked by a single point only
                     continue
-
-                # Convert physical Z to slice index
-                slice_idx = int(round((z_pos - ct_origin_z) / ct_spacing_z))
-                if slice_idx < 0 or slice_idx >= num_slices:
+                if sop_to_index and sop_uid in sop_to_index:
+                    slice_idx = sop_to_index[sop_uid]
+                elif z_pos is not None:
+                    slice_idx = int(round((z_pos - ct_origin_z) / ct_spacing_z))
+                else:
+                    continue
+                if not 0 <= slice_idx < num_slices:
                     continue
 
                 contour = np.array(edges)
-                try:
-                    rr, cc = polygon(
-                        contour[:, 1], contour[:, 0],
-                        shape=volume_shape,
-                    )
-                    vote_volume[slice_idx, rr, cc] += 1
-                except Exception:
-                    continue
+                rr, cc = polygon(contour[:, 1], contour[:, 0], shape=volume_shape)
+                target = include if inclusion else exclude
+                if slice_idx not in target:
+                    target[slice_idx] = np.zeros(volume_shape, dtype=bool)
+                target[slice_idx][rr, cc] = True
 
-    max_votes = vote_volume.max()
-    threshold = 2 if max_votes >= 2 else 1
-    mask_volume = (vote_volume >= threshold).astype(np.uint8)
-    return mask_volume
+        for slice_idx, m in include.items():
+            if slice_idx in exclude:
+                m = m & ~exclude[slice_idx]
+            vote_volume[slice_idx] += m
+
+    threshold = 2 if vote_volume.max() >= 2 else 1
+    return (vote_volume >= threshold).astype(np.uint8)
 
 
 def process_lidc_dataset(
@@ -623,6 +667,7 @@ def process_lidc_dataset(
     case_counts = {"train": 0, "val": 0, "test": 0}
     kept_ids: List[str] = []
     saved_by_patient: Dict[str, Tuple[int, int]] = {}
+    contrast_by_case: Dict[str, Optional[float]] = {}
     staging_root = out_path / "_lidc_staging"
     shutil.rmtree(staging_root, ignore_errors=True)
     reader = sitk.ImageSeriesReader()
@@ -647,6 +692,11 @@ def process_lidc_dataset(
             if xml_path is None:
                 skipped["no_xml"] += 1
                 continue
+            # Slice k of the volume is file k of the sorted series: map each instance UID to it.
+            sop_to_index = {
+                str(pydicom.dcmread(f, stop_before_pixels=True, specific_tags=["SOPInstanceUID"]).SOPInstanceUID): k
+                for k, f in enumerate(series_files)
+            }
 
             reader.SetFileNames(series_files)
             ct_image = reader.Execute()
@@ -658,7 +708,7 @@ def process_lidc_dataset(
                 skipped["error"] += 1
                 continue
             mask_native = _extract_nodule_masks_from_xml(
-                xml_path, ct_image.GetOrigin()[2], z_step, num_slices, (size_y, size_x)
+                xml_path, ct_image.GetOrigin()[2], z_step, num_slices, (size_y, size_x), sop_to_index
             )
             if not mask_native.any():
                 skipped["no_nodules"] += 1
@@ -674,9 +724,11 @@ def process_lidc_dataset(
             staging = staging_root / patient_id
             for sub in ("images", "masks", "level_sets"):
                 os.makedirs(staging / sub, exist_ok=True)
-            saved_by_patient[patient_id] = save_case_slices(
+            saved, with_lesion, contrast = save_case_slices(
                 ct_zyx, mask_zyx, indices, f"lidc_{patient_id}", staging, target_size
             )
+            saved_by_patient[patient_id] = (saved, with_lesion)
+            contrast_by_case[f"lidc_{patient_id}"] = contrast
             kept_ids.append(patient_id)
             pbar.set_postfix({"usable": len(kept_ids)})
         except Exception as e:
@@ -709,6 +761,7 @@ def process_lidc_dataset(
         "slices_with_lesion": lesion_counts,
         "skipped": skipped,
         "seed": seed,
+        **contrast_report(contrast_by_case),
     }
     with open(out_path / "lidc_manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)

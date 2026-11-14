@@ -311,6 +311,7 @@ def train(
         lambda_context=cfg.lambda_context,
         use_focal=cfg.use_focal,
         consistency_weight=cfg.consistency_weight,
+        dice_mode=cfg.dice_mode,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -446,6 +447,7 @@ def main():
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
     parser.add_argument("--consistency-weight", type=float, default=1.0, help="Maximum of the consistency ramp lambda_d(t) (default: 1.0 per Eq. 10)")
     parser.add_argument("--bce-weight", type=float, default=0.0, help="BCE loss weight (default: 0.0 for pure Soft Dice per Eq. 8; >0 for compound loss)")
+    parser.add_argument("--dice-mode", default="hybrid", choices=["batch", "slice", "hybrid"], help="Dice aggregation over a batch (default: hybrid; see losses/seg_loss.py)")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight (default: 1.0 matching Eq. 8 & 10)")
     parser.add_argument("--pos-weight", type=float, default=20.0, help="Positive class weight if BCE is enabled")
     parser.add_argument("--use-focal", action="store_true", default=False, help="Use Focal Loss instead of BCE if bce-weight > 0")
@@ -476,6 +478,7 @@ def main():
         consistency_weight=args.consistency_weight,
         bce_weight=args.bce_weight,
         dice_weight=args.dice_weight,
+        dice_mode=args.dice_mode,
         pos_weight=args.pos_weight,
         use_focal=args.use_focal,
         num_stages=args.num_stages,

@@ -143,6 +143,7 @@ class DTCRTotalLoss(nn.Module):
         lambda_context: float = 0.0,
         use_focal: bool = False,
         consistency_weight: float = 1.0,
+        dice_mode: str = "hybrid",
     ):
         super().__init__()
         from .seg_loss import SupervisedSegLoss
@@ -154,6 +155,7 @@ class DTCRTotalLoss(nn.Module):
             dice_weight=dice_weight,
             pos_weight=pos_weight,
             use_focal=use_focal,
+            dice_mode=dice_mode,
         )
         self.lsf_criterion = SupervisedLSFLoss(beta=beta)
         self.dtc_criterion = DualTaskConsistencyLoss(

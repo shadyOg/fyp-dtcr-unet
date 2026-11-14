@@ -10,42 +10,56 @@ import torch.nn.functional as F
 
 
 class DiceLoss(nn.Module):
-    """Soft Dice Loss for binary segmentation matching Eq. 8 of paper."""
+    """Soft Dice Loss for binary segmentation (Eq. 8 of the paper)."""
 
-    def __init__(self, smooth: float = 1.0, batch_dice: bool = True):
+    MODES = ("batch", "slice", "hybrid")
+
+    def __init__(self, smooth: float = 1.0, mode: str = "hybrid"):
         """
         Args:
             smooth: Additive constant (epsilon in Eq. 8).
-            batch_dice: Pool intersection and cardinality over the whole batch before
-                forming the ratio. Per-sample Dice is ill-behaved on lesion-free slices
-                (a handful of false-positive pixels already costs ~1.0, as much as
-                missing a whole lesion), and those context slices are a large share
-                of the data; pooling weights every error by its actual pixel mass.
+            mode: How Dice is aggregated over a batch.
+                "batch": pool all pixels of the batch, then one ratio. Robust on
+                    lesion-free slices, but weights each lesion by its pixel count,
+                    so a 20 px nodule next to a 3000 px consolidation barely counts.
+                "slice": one Dice per slice, averaged. Every lesion counts equally,
+                    but on a lesion-free slice a few false-positive pixels cost ~1.0.
+                "hybrid" (default): mean of "batch" over all slices and "slice" over
+                    the slices that contain lesion. Small lesions get their own term,
+                    while false positives on empty slices are still priced by pixel mass.
         """
         super().__init__()
+        if mode not in self.MODES:
+            raise ValueError(f"mode must be one of {self.MODES}, got {mode!r}")
         self.smooth = smooth
-        self.batch_dice = batch_dice
+        self.mode = mode
+
+    def _dice(self, p: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        inter = (p * t).sum(dim=1)
+        card = p.sum(dim=1) + t.sum(dim=1)
+        return (2.0 * inter + self.smooth) / (card + self.smooth)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred: Predicted probabilities or sigmoid outputs of shape (B, 1, H, W).
+            pred: Predicted probabilities of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        pred_safe = torch.clamp(pred.float(), min=0.0, max=1.0)
-        target = target.float()
-        if self.batch_dice:
-            pred_flat = pred_safe.reshape(1, -1)
-            target_flat = target.reshape(1, -1)
-        else:
-            pred_flat = pred_safe.reshape(pred_safe.size(0), -1)
-            target_flat = target.reshape(target.size(0), -1)
+        p = torch.clamp(pred.float(), 0.0, 1.0).reshape(pred.size(0), -1)
+        t = target.float().reshape(target.size(0), -1)
 
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        cardinality = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
+        batch_loss = 1.0 - self._dice(p.reshape(1, -1), t.reshape(1, -1)).mean()
+        if self.mode == "batch":
+            return batch_loss
 
-        dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
-        return (1.0 - dice).mean()
+        if self.mode == "slice":
+            return (1.0 - self._dice(p, t)).mean()
+
+        has_lesion = t.sum(dim=1) > 0
+        if not has_lesion.any():
+            return batch_loss
+        slice_loss = (1.0 - self._dice(p[has_lesion], t[has_lesion])).mean()
+        return 0.5 * (batch_loss + slice_loss)
 
 
 class FocalLoss(nn.Module):
@@ -79,6 +93,7 @@ class SupervisedSegLoss(nn.Module):
         smooth: float = 1.0,
         pos_weight: float = 1.0,
         use_focal: bool = False,
+        dice_mode: str = "hybrid",
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
     ):
@@ -87,7 +102,7 @@ class SupervisedSegLoss(nn.Module):
         self.dice_weight = dice_weight
         self.use_focal = use_focal
         self.register_buffer("pw", torch.tensor([pos_weight]))
-        self.dice_loss = DiceLoss(smooth=smooth)
+        self.dice_loss = DiceLoss(smooth=smooth, mode=dice_mode)
         if use_focal:
             self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
 

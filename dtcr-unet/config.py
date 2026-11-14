@@ -32,6 +32,7 @@ class DTCRConfig:
     consistency_weight: float = 1.0 # Maximum of the ramp lambda_d(t); 1.0 reproduces Eq. 10
     bce_weight: float = 0.0       # BCE loss weight (0.0 for pure Soft Dice per Eq. 8; >0 if compound loss)
     dice_weight: float = 1.0      # Soft Dice weight (Eq. 8 primary objective)
+    dice_mode: str = "hybrid"     # Dice aggregation over a batch: batch | slice | hybrid (losses/seg_loss.py)
     pos_weight: float = 20.0      # Positive lesion pixel weighting if BCE is used (balances 99.76% background)
     use_focal: bool = False       # Use Focal Loss if BCE is enabled
     fuse_val: bool = False        # Evaluate the segmentation head f1 alone (single forward pass)
