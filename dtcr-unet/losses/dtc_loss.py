@@ -22,14 +22,14 @@ def compute_spatial_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     return grad_x, grad_y
 
 
-def get_dynamic_consistency_weight(current_epoch: int, max_epochs: int, max_weight: float = 0.1) -> float:
+def get_dynamic_consistency_weight(current_epoch: float, max_epochs: int, max_weight: float = 1.0) -> float:
     """Calculate the Gaussian ramp-up consistency weight lambda_d(t).
 
-    Per Eq. (10) of the paper and DTC benchmark (Luo et al., AAAI 2021):
-        lambda_d(t) = max_weight * exp(-5 * (1 - t / t_max)^2)
-
-    max_weight=0.1 ensures consistency regularization aids feature representation
-    without overwhelming the supervised Dice loss on labeled data.
+    Per Eq. (10) of the paper:
+        lambda_d(t) = exp(-5 * (1 - t / t_max)^2)
+    which rises from exp(-5) ~ 0.007 at the start to 1.0 at the end of training.
+    `max_weight` rescales the curve (1.0 reproduces the paper). `current_epoch`
+    may be fractional so the weight can advance every iteration.
     """
     if max_epochs <= 0:
         return max_weight
@@ -142,7 +142,7 @@ class DTCRTotalLoss(nn.Module):
         pos_weight: float = 1.0,
         lambda_context: float = 0.0,
         use_focal: bool = False,
-        consistency_weight: float = 0.1,
+        consistency_weight: float = 1.0,
     ):
         super().__init__()
         from .seg_loss import SupervisedSegLoss
@@ -170,7 +170,7 @@ class DTCRTotalLoss(nn.Module):
         target_mask: torch.Tensor,
         target_lsf: torch.Tensor,
         is_labeled_mask: torch.Tensor,
-        epoch: int,
+        epoch: float,
         max_epochs: int,
     ) -> Tuple[torch.Tensor, dict]:
         """

@@ -12,9 +12,19 @@ import torch.nn.functional as F
 class DiceLoss(nn.Module):
     """Soft Dice Loss for binary segmentation matching Eq. 8 of paper."""
 
-    def __init__(self, smooth: float = 1.0):
+    def __init__(self, smooth: float = 1.0, batch_dice: bool = True):
+        """
+        Args:
+            smooth: Additive constant (epsilon in Eq. 8).
+            batch_dice: Pool intersection and cardinality over the whole batch before
+                forming the ratio. Per-sample Dice is ill-behaved on lesion-free slices
+                (a handful of false-positive pixels already costs ~1.0, as much as
+                missing a whole lesion), and those context slices are a large share
+                of the data; pooling weights every error by its actual pixel mass.
+        """
         super().__init__()
         self.smooth = smooth
+        self.batch_dice = batch_dice
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -22,9 +32,14 @@ class DiceLoss(nn.Module):
             pred: Predicted probabilities or sigmoid outputs of shape (B, 1, H, W).
             target: Ground truth binary mask of shape (B, 1, H, W).
         """
-        pred_safe = torch.clamp(pred, min=0.0, max=1.0)
-        pred_flat = pred_safe.contiguous().view(pred_safe.size(0), -1)
-        target_flat = target.contiguous().view(target.size(0), -1)
+        pred_safe = torch.clamp(pred.float(), min=0.0, max=1.0)
+        target = target.float()
+        if self.batch_dice:
+            pred_flat = pred_safe.reshape(1, -1)
+            target_flat = target.reshape(1, -1)
+        else:
+            pred_flat = pred_safe.reshape(pred_safe.size(0), -1)
+            target_flat = target.reshape(target.size(0), -1)
 
         intersection = (pred_flat * target_flat).sum(dim=1)
         cardinality = pred_flat.sum(dim=1) + target_flat.sum(dim=1)

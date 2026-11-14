@@ -44,7 +44,7 @@ def evaluate_checkpoint(
 
     print(f"Loading checkpoint from: {checkpoint_path}")
     print(f"Evaluation settings: Threshold={threshold} | Dual-Task Fusion={fuse_dual_task}")
-    checkpoint = torch.load(checkpoint_path, map_location=dev)
+    checkpoint = torch.load(checkpoint_path, map_location=dev, weights_only=False)
     state_dict = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint))
 
     # Auto-detect number of stages if not explicitly specified
@@ -66,6 +66,7 @@ def evaluate_checkpoint(
     metrics_list = []
     lesion_slice_metrics = []
     patient_slices = {}  # pid -> list of (prob_2d, mask_2d)
+    patient_dataset = {}  # pid -> source dataset (mosmed, lidc, covid19)
     saved_vis_count = 0
 
     with torch.no_grad():
@@ -73,6 +74,7 @@ def evaluate_checkpoint(
             images = batch["image"].to(dev)
             masks = batch["mask"].cpu().numpy()
             patient_ids = batch.get("patient_id", [f"unknown_{batch_idx}_{i}" for i in range(len(images))])
+            dataset_names = batch.get("dataset", ["unknown"] * len(images))
 
             f1_logits, f2_lsf, f2_trans = model(images)
             f1_probs = torch.sigmoid(f1_logits).cpu().numpy()
@@ -93,6 +95,7 @@ def evaluate_checkpoint(
 
                 pid = patient_ids[i] if isinstance(patient_ids, (list, tuple)) else str(patient_ids)
                 patient_slices.setdefault(pid, []).append((probs[i, 0], masks[i, 0]))
+                patient_dataset[pid] = dataset_names[i]
 
                 if save_predictions:
                     pred_bin = (probs[i, 0] > threshold).astype(np.uint8)
@@ -166,6 +169,7 @@ def evaluate_checkpoint(
 
         patient_metrics.append({
             "patient_id": pid,
+            "dataset": patient_dataset.get(pid, "unknown"),
             "dice": p_dice,
             "sensitivity": p_se,
             "specificity": p_sp,
@@ -183,7 +187,14 @@ def evaluate_checkpoint(
             "median": float(np.median(vals)),
         }
 
+    # Patient-level Dice per source dataset
+    dataset_summary = {}
+    for ds in sorted(set(pm["dataset"] for pm in patient_metrics)):
+        vals = [pm["dice"] for pm in patient_metrics if pm["dataset"] == ds]
+        dataset_summary[ds] = {"dice_mean": float(np.mean(vals)), "dice_std": float(np.std(vals)), "patients": len(vals)}
+
     full_results = {
+        "patient_level_by_dataset": dataset_summary,
         "slice_level_all": slice_summary,
         "slice_level_lesion_only": lesion_summary,
         "patient_level_3d": vol_summary,
@@ -197,7 +208,10 @@ def evaluate_checkpoint(
     print("      PATIENT-LEVEL 3D EVALUATION (Paper Protocol Table 2)")
     print("=" * 60)
     for k, v in vol_summary.items():
-        print(f"  {k.upper():<15}: {v['mean']:.2f}% ± {v['std']:.2f}%")
+        print(f"  {k.upper():<15}: {v['mean']:.2f}% +- {v['std']:.2f}%")
+    print(f"  Patients       : {len(patient_metrics)}")
+    for ds, v in dataset_summary.items():
+        print(f"  Dice [{ds}]: {v['dice_mean']:.2f}% +- {v['dice_std']:.2f}% ({v['patients']} patients)")
     print("=" * 60)
 
     if lesion_summary:
@@ -205,14 +219,14 @@ def evaluate_checkpoint(
         print("      LESION-ONLY SLICE EVALUATION (Excl. Empty Slices)")
         print("=" * 60)
         for k, v in lesion_summary.items():
-            print(f"  {k.upper():<15}: {v['mean']:.2f} ± {v['std']:.2f}")
+            print(f"  {k.upper():<15}: {v['mean']:.2f} +- {v['std']:.2f}")
         print("=" * 60)
 
     print("\n" + "=" * 60)
     print("      RAW 2D SLICE EVALUATION (All Slices)")
     print("=" * 60)
     for k, v in slice_summary.items():
-        print(f"  {k.upper():<15}: {v['mean']:.2f} ± {v['std']:.2f}")
+        print(f"  {k.upper():<15}: {v['mean']:.2f} +- {v['std']:.2f}")
     print("=" * 60)
 
     # Save to JSON

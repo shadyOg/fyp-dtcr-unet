@@ -38,9 +38,15 @@ def compute_tensor_gradients(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
     return grad_x, grad_y
 
 
+# Steepness of T^{-1}. The level set target saturates at 8 px (data/level_set.py),
+# so one pixel is 0.125 LSF units and the first pixel inside a lesion sits at
+# -0.0625: k = 64 maps it to sigmoid(4) = 0.98, i.e. T^{-1}(T(y)) reproduces y.
+LSF_INVERSE_K = 64.0
+
+
 def inverse_level_set_transform(
     z: torch.Tensor,
-    k: float = 50.0,
+    k: float = LSF_INVERSE_K,
     include_smoothing_terms: bool = False,
     lambda1: float = 0.01,
     lambda2: float = 0.01,
@@ -48,14 +54,11 @@ def inverse_level_set_transform(
     """Differentiable inverse mapping T^{-1}(z) converting Level Set output back to segmentation space.
 
     Per Eq. (2) in the DTCR-U-Net paper:
-        T^{-1}(z) = sigma(-k * z) + R(z) + S(z)
-        where sigma(-k * z) maps z < 0 (inside lesion) -> 1.0, z > 0 (background) -> 0.0.
+        T^{-1}(z) = sigma(k * z) + R(z) + S(z)
+    The paper's Eq. (1) defines the level set as negative inside the lesion, so the
+    sigmoid is applied to -k * z: z < 0 (inside) -> 1, z > 0 (background) -> 0.
         R(z) = ||nabla z||^2 is gradient smoothing regularization.
         S(z) = ||nabla z|| is geometric consistency regularization.
-
-    For normalized distance maps z in [-1, 1], k=50.0 yields a proper ~3-5px transition band
-    around lesion boundaries, ensuring high probability (0.80-0.98) inside lesions.
-    For primary probability space alignment, sigma(-k * z) is clamped to [0, 1].
     """
     z_clamped = torch.clamp(z, min=-10.0, max=10.0)
     prob_map = torch.sigmoid(-k * z_clamped)
@@ -239,7 +242,8 @@ class DTCR_UNet(nn.Module):
 
         # 4. Dual Task Predictions
         f1_logits = torch.clamp(self.seg_head(d_out), min=-20.0, max=20.0)
-        f2_lsf = torch.clamp(self.lsf_head(d_out), min=-5.0, max=5.0)
+        # tanh bounds the regression to the [-1, 1] range of the level set target T(y)
+        f2_lsf = torch.tanh(self.lsf_head(d_out).float())
 
         # 5. Differentiable Inverse Mapping T^{-1}(z) per Eq. 2
         f2_trans = inverse_level_set_transform(f2_lsf)

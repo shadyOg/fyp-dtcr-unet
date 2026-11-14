@@ -28,13 +28,13 @@ class DTCRConfig:
     lambda1: float = 0.3          # Gradient consistency weight for Dual-Task Consistency loss (optimal per Fig. 7)
     lambda2: float = 1.0          # Interaction enhancement weight for Dual-Task Consistency loss (Section 4.6)
     lambda_context: float = 0.0   # Context-guided loss weight (0.0 matching Eq. 4 & Section 4.6)
-    lambda_smooth: float = 0.3    # Level Set smoothing regularization parameter (Fig. 7)
-    consistency_weight: float = 0.1 # Maximum weight for dynamic consistency lambda_d(t) (default: 0.1 per DTC AAAI 2021)
+
+    consistency_weight: float = 1.0 # Maximum of the ramp lambda_d(t); 1.0 reproduces Eq. 10
     bce_weight: float = 0.0       # BCE loss weight (0.0 for pure Soft Dice per Eq. 8; >0 if compound loss)
     dice_weight: float = 1.0      # Soft Dice weight (Eq. 8 primary objective)
     pos_weight: float = 20.0      # Positive lesion pixel weighting if BCE is used (balances 99.76% background)
     use_focal: bool = False       # Use Focal Loss if BCE is enabled
-    fuse_val: bool = False        # Primary segmentation head f1 inference (single forward pass per Section 4.1)
+    fuse_val: bool = False        # Evaluate the segmentation head f1 alone (single forward pass)
     val_threshold: float = 0.50   # Standard binarization threshold (Section 4.3)
 
     # Model architecture (Table 1: 18.65M parameters)
