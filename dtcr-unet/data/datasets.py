@@ -106,31 +106,39 @@ class DualTaskDataset(Dataset):
     def __len__(self) -> int:
         return len(self.img_paths)
 
+    @staticmethod
+    def _hwc(arr: np.ndarray) -> np.ndarray:
+        """cv2 drops the channel axis of single-channel images: put it back."""
+        return arr[..., None] if arr.ndim == 2 else arr
+
     def _augment(self, img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Synchronized flipping, rotation and scale-cropping (Section 4.1) plus mild gamma jitter."""
+        """Synchronized flip, rotation and scale-crop plus mild gamma jitter.
+
+        Args:
+            img: (H, W, C) float32 in [0, 1].
+            mask: (H, W) float32.
+        """
+        h, w = mask.shape
+
         # 1. Random horizontal flip (left/right lung symmetry)
         if random.random() > 0.5:
-            img = np.fliplr(img).copy()
-            mask = np.fliplr(mask).copy()
+            img = img[:, ::-1]
+            mask = mask[:, ::-1]
 
         # 2. Small rotation (+/- 10 degrees)
         if random.random() > 0.5:
-            angle = random.uniform(-10.0, 10.0)
-            h, w = img.shape
-            rot_mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, scale=1.0)
-            img = cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
-            mask = cv2.warpAffine(mask, rot_mat, (w, h), flags=cv2.INTER_NEAREST,
+            rot_mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), random.uniform(-10.0, 10.0), scale=1.0)
+            img = self._hwc(cv2.warpAffine(np.ascontiguousarray(img), rot_mat, (w, h), flags=cv2.INTER_LINEAR,
+                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0.0))
+            mask = cv2.warpAffine(np.ascontiguousarray(mask), rot_mat, (w, h), flags=cv2.INTER_NEAREST,
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
 
         # 3. Random scale, then centre crop / pad back to size (zoom 0.9x to 1.1x)
         if random.random() > 0.5:
             scale = random.uniform(0.90, 1.10)
-            h, w = img.shape
             new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
-            img_s = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            mask_s = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-
+            img_s = self._hwc(cv2.resize(np.ascontiguousarray(img), (new_w, new_h), interpolation=cv2.INTER_LINEAR))
+            mask_s = cv2.resize(np.ascontiguousarray(mask), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
             if scale >= 1.0:
                 sh, sw = (new_h - h) // 2, (new_w - w) // 2
                 img = img_s[sh:sh + h, sw:sw + w]
@@ -138,7 +146,7 @@ class DualTaskDataset(Dataset):
             else:
                 ph, pw = (h - new_h) // 2, (w - new_w) // 2
                 pad = ((ph, h - new_h - ph), (pw, w - new_w - pw))
-                img = np.pad(img_s, pad, mode="constant", constant_values=0)
+                img = np.pad(img_s, pad + ((0, 0),), mode="constant", constant_values=0)
                 mask = np.pad(mask_s, pad, mode="constant", constant_values=0)
 
         # 4. Mild gamma jitter (scanner / reconstruction variability)
@@ -153,22 +161,25 @@ class DualTaskDataset(Dataset):
         is_labeled = self.is_labeled_list[idx]
 
         img = np.load(img_path).astype(np.float32)
+        img = img[None] if img.ndim == 2 else img          # (C, H, W): 1 or 3 (2.5D) channels
+        h, w = img.shape[1:]
 
         # Unlabeled samples never touch their annotation file.
         mask_path = self.data_dir / "masks" / name
         if is_labeled and mask_path.exists():
             mask = (np.load(mask_path) > 0).astype(np.float32)
         else:
-            mask = np.zeros_like(img)
+            mask = np.zeros((h, w), dtype=np.float32)
 
         if self.transform:
-            img, mask = self._augment(img, mask)
+            img_hwc, mask = self._augment(np.transpose(img, (1, 2, 0)), mask)
+            img = np.ascontiguousarray(np.transpose(img_hwc, (2, 0, 1)))
 
         # T(y) from the final mask, so augmentation can never desynchronize the two targets.
         lsf = compute_level_set(mask)
 
         return {
-            "image": torch.from_numpy(img[None]).float(),
+            "image": torch.from_numpy(img).float(),
             "mask": torch.from_numpy(mask[None]).float(),
             "level_set": torch.from_numpy(lsf[None]).float(),
             "is_labeled": torch.tensor(is_labeled, dtype=torch.bool),
@@ -176,6 +187,12 @@ class DualTaskDataset(Dataset):
             "patient_id": self.patient_ids[idx],
             "dataset": self.datasets[idx],
         }
+
+    @property
+    def num_channels(self) -> int:
+        """Input channels of the saved images (1, or 3 for 2.5D)."""
+        arr = np.load(self.img_paths[0], mmap_mode="r")
+        return 1 if arr.ndim == 2 else int(arr.shape[0])
 
 
 class TwoStreamBatchSampler(torch.utils.data.Sampler):

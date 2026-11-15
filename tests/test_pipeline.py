@@ -191,7 +191,7 @@ def test_lidc_processing():
 
         n_lesion = 0
         for mp in sorted(out.glob("*/masks/lidc_*.npy")):
-            msk, img = np.load(mp), np.load(mp.parent.parent / "images" / mp.name)
+            msk, img = np.load(mp), np.load(mp.parent.parent / "images" / mp.name)[1].astype(np.float32)
             if msk.any():
                 n_lesion += 1
                 # The contour must land on the bright blob, i.e. the right slice and the right place
@@ -262,7 +262,9 @@ def test_end_to_end_pipeline():
         # including the 8-bit case (which would be squashed if treated as HU).
         for ip in sorted(out.glob("*/images/*.npy")):
             img, msk = np.load(ip), np.load(ip.parent.parent / "masks" / ip.name)
-            assert img.dtype == np.float32 and 0.0 <= img.min() and img.max() <= 1.0
+            assert img.shape == (3, 64, 64), img.shape          # 2.5D: slice and its two neighbours
+            assert img.dtype == np.float16 and 0.0 <= img.min() and img.max() <= 1.0
+            img = img[1].astype(np.float32)
             if msk.any():
                 assert img[msk > 0].mean() > img[msk == 0].mean() + 0.15, f"low lesion contrast in {ip.name}"
 
@@ -286,7 +288,7 @@ def test_end_to_end_pipeline():
         n_labeled_with_lesion = 0
         for i in range(len(ds)):
             item = ds[i]
-            assert item["image"].shape == (1, 64, 64) and item["level_set"].shape == (1, 64, 64)
+            assert item["image"].shape == (3, 64, 64) and item["level_set"].shape == (1, 64, 64)
             if not item["is_labeled"]:
                 assert item["mask"].sum() == 0, "unlabeled sample leaked its mask"
             else:
@@ -323,8 +325,8 @@ def test_end_to_end_pipeline():
         class Oracle(torch.nn.Module):
             """Predicts the true mask on lesion slices of the first half of each batch, nothing elsewhere."""
             def forward(self, x):
-                logits = torch.full_like(x, -10.0)
-                return logits, torch.ones_like(x), torch.zeros_like(x)
+                logits = torch.full_like(x[:, :1], -10.0)
+                return logits, torch.ones_like(logits), torch.zeros_like(logits)
 
         empty = evaluate_dataset(Oracle(), val_loader, torch.device("cpu"), use_amp=False)
         assert empty["dice"] == 0.0 and empty["sensitivity"] == 0.0 and empty["specificity"] == 100.0
@@ -337,7 +339,88 @@ def test_end_to_end_pipeline():
         assert results["total_patients"] == 3
         assert set(results["patient_level_by_dataset"]) == {"mosmed", "covid19"}
 
+        # The threshold is chosen on validation, stored in the checkpoint and used at test time
+        ckpt = torch.load(tmp / "ckpt" / "best_model.pth", weights_only=False)
+        assert 0.1 <= ckpt["best_threshold"] <= 0.9 and ckpt["tta"] is True
+        assert results["threshold"] == ckpt["best_threshold"] and results["tta"] is True
+        assert ckpt["config"]["in_channels"] == 3 and ckpt["config"]["arch"] == "dtcr"
+
+        # The pretrained-encoder variant trains, calibrates and evaluates through the same code path
+        cfg_r = DTCRConfig(
+            data_dir=str(out), epochs=1, batch_size=4, num_workers=0, labeled_ratio=1.0,
+            checkpoint_dir=str(tmp / "ckpt_r"), output_dir=str(tmp / "outputs_r"), device="cpu",
+            arch="dtcr_resnet34", pretrained=False, bce_weight=1.0, pos_weight=1.0,
+        )
+        train(cfg_r, grad_accum_steps=1, use_amp=False)
+        results_r = evaluate_checkpoint(
+            str(tmp / "ckpt_r" / "best_dice_model.pth"), str(out), output_dir=str(tmp / "eval_r"),
+            batch_size=4, device="cpu", save_visualizations=2,
+        )
+        assert results_r["total_patients"] == 3
+        assert torch.load(tmp / "ckpt_r" / "best_dice_model.pth", weights_only=False)["config"]["arch"] == "dtcr_resnet34"
+
     print("Pipeline tests passed.")
+
+
+def _chest_volume(rng: np.random.Generator, size: int = 128, depth: int = 10):
+    """Air around a body ellipse holding two lungs; a soft-tissue lesion in the right lung.
+
+    Each slice gets its own small intensity offset so neighbouring slices differ.
+    """
+    yy, xx = np.mgrid[:size, :size]
+    body = ((yy - 64) / 40.0) ** 2 + ((xx - 64) / 56.0) ** 2 <= 1
+    lung_r = ((yy - 62) / 26.0) ** 2 + ((xx - 42) / 16.0) ** 2 <= 1
+    lung_l = ((yy - 62) / 26.0) ** 2 + ((xx - 86) / 16.0) ** 2 <= 1
+    lesion = (yy - 60) ** 2 + (xx - 40) ** 2 <= 16
+    ct = np.full((depth, size, size), -1000.0, dtype=np.float32)
+    mask = np.zeros((depth, size, size), dtype=np.uint8)
+    for z in range(depth):
+        sl = ct[z]
+        sl[body] = 40.0
+        sl[lung_r | lung_l] = -850.0 + 15.0 * z
+        if 3 <= z <= 6:
+            sl[lesion] = 20.0
+            mask[z][lesion] = 1
+        sl += rng.normal(0.0, 5.0, size=sl.shape).astype(np.float32)
+    return ct, mask
+
+
+def test_lung_crop_and_2p5d():
+    from data.preprocessing import lung_bbox, normalize_ct_slice, resize_slice, save_case_slices, select_slices
+
+    ct, mask = _chest_volume(np.random.default_rng(4))
+    idx = select_slices(mask, 2)
+    y0, y1, x0, x1 = lung_bbox(ct, mask, idx)
+    assert y1 - y0 == x1 - x0, "crop must be square"
+    assert (y1 - y0) < 0.75 * 128, f"crop {y1 - y0}px barely smaller than the slice"
+    ys, xs = np.nonzero(mask.any(axis=0))
+    assert y0 <= ys.min() and ys.max() < y1 and x0 <= xs.min() and xs.max() < x1, "lesion outside the crop"
+    assert x0 <= 26 and x1 >= 102, "crop cuts into a lung"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        split = Path(tmp)
+        for sub in ("images", "masks", "level_sets"):
+            (split / sub).mkdir()
+        saved, with_lesion, contrast = save_case_slices(ct, mask, idx, "mosmed_study_0001", split, (64, 64))
+        assert saved == len(idx) and with_lesion == 4 and contrast > 0.15
+
+        img4 = np.load(split / "images" / "mosmed_study_0001_s4.npy")
+        img5 = np.load(split / "images" / "mosmed_study_0001_s5.npy")
+        assert img4.shape == (3, 64, 64)
+        assert np.array_equal(img5[0], img4[1]) and np.array_equal(img4[2], img5[1]), "neighbour channels are wrong"
+        # Edge slice: the missing neighbour repeats the slice itself
+        img0 = np.load(split / "images" / f"mosmed_study_0001_s{idx[0]}.npy")
+        if idx[0] == 0:
+            assert np.array_equal(img0[0], img0[1])
+
+        # The crop makes the lesion bigger on the network input than plain resizing would
+        cropped_area = np.load(split / "masks" / "mosmed_study_0001_s4.npy").sum()
+        full_area = resize_slice(mask[4], (64, 64), is_mask=True).sum()
+        assert cropped_area > 1.5 * full_area, (cropped_area, full_area)
+
+    # Non-HU (8-bit) volumes and slices without a lung region keep the full field of view
+    assert lung_bbox(np.clip((ct + 1000) / 5, 0, 255), mask, idx) is None
+    assert lung_bbox(np.full_like(ct, 40.0), mask, idx) is None
 
 
 def test_dice_modes():
@@ -362,6 +445,7 @@ def test_dice_modes():
 
 
 if __name__ == "__main__":
+    test_lung_crop_and_2p5d()
     test_dice_modes()
     test_level_set_round_trip()
     test_covid_pairing_picks_infection_mask()

@@ -39,6 +39,10 @@ class DTCRConfig:
     val_threshold: float = 0.50   # Standard binarization threshold (Section 4.3)
 
     # Model architecture (Table 1: 18.65M parameters)
+    arch: str = "dtcr"            # "dtcr" (paper network) or "dtcr_resnet34" (ImageNet-pretrained encoder)
+    pretrained: bool = True       # load ImageNet weights for dtcr_resnet34
+    encoder_lr_mult: float = 0.1  # learning-rate factor for the pretrained encoder
+    tta: bool = True              # horizontal-flip test-time augmentation at validation / test
     in_channels: int = 1
     n_classes: int = 1
     base_channels: int = 64

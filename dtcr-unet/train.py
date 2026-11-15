@@ -21,10 +21,11 @@ from tqdm import tqdm
 from config import DTCRConfig
 from data.datasets import get_dataloaders
 from losses.dtc_loss import DTCRTotalLoss
-from models.dtcr_unet import DTCR_UNet
-from utils import save_checkpoint
+from models.dtcr_resnet import build_model
+from utils import load_model_from_checkpoint, predict_probs, save_checkpoint
 
 LOSS_KEYS = ("loss_total", "loss_seg", "loss_lsf", "loss_dtc", "l_main", "l_grad", "l_interact")
+SWEEP_THRESHOLDS = tuple(round(0.10 + 0.05 * i, 2) for i in range(17))   # 0.10 ... 0.90
 
 
 def set_seed(seed: int) -> None:
@@ -146,6 +147,8 @@ def evaluate_dataset(
     use_amp: bool = True,
     fuse_val: bool = False,
     threshold: float = 0.50,
+    tta: bool = False,
+    thresholds: tuple = SWEEP_THRESHOLDS,
 ) -> dict:
     """Evaluate on a validation / test loader.
 
@@ -154,11 +157,16 @@ def evaluate_dataset(
     patients. This is the quantity the paper reports (Table 2, mean +/- std over
     patients). `lesion_dice` is the older per-slice mean over lesion slices, which
     is systematically lower because small lesions on single slices dominate it.
+
+    `dice_by_threshold` gives the patient-level Dice at each value of `thresholds`
+    (computed in the same pass), used to pick the binarization threshold on
+    validation data only.
     """
     model.eval()
     amp_on = use_amp and device.type == "cuda"
 
     patient_counts: Dict[str, np.ndarray] = {}   # pid -> [tp, fp, fn, tn]
+    sweep_counts: Dict[str, np.ndarray] = {}     # pid -> (n_thresholds, 4)
     patient_dataset: Dict[str, str] = {}
     slice_dices = []
     loss_sums = {k: 0.0 for k in ("loss_total", "loss_seg", "loss_lsf", "loss_dtc")}
@@ -175,7 +183,7 @@ def evaluate_dataset(
         bsz = images.size(0)
 
         with torch.amp.autocast(device_type=device.type, enabled=amp_on):
-            f1_logits, f2_lsf, f2_trans = model(images)
+            (f1_logits, f2_lsf, f2_trans), probs = predict_probs(model, images, tta=tta, fuse=fuse_val)
             if criterion is not None:
                 _, loss_dict = criterion(
                     f1_logits=f1_logits,
@@ -193,11 +201,16 @@ def evaluate_dataset(
 
         f1_probs = torch.sigmoid(f1_logits.float())
         f2_trans = f2_trans.float()
-        probs = 0.5 * f1_probs + 0.5 * f2_trans if fuse_val else f1_probs
 
         pred = probs > threshold
         target = masks > 0.5
         dims = (1, 2, 3)
+        sweep = []
+        for t in thresholds:
+            pt = probs > t
+            sweep.append(torch.stack([(pt & target).sum(dims), (pt & ~target).sum(dims),
+                                      (~pt & target).sum(dims), (~pt & ~target).sum(dims)], dim=1))
+        sweep = torch.stack(sweep, dim=1).double().cpu().numpy()      # (B, n_thresholds, 4)
         tp = (pred & target).sum(dims).double()
         fp = (pred & ~target).sum(dims).double()
         fn = (~pred & target).sum(dims).double()
@@ -222,8 +235,10 @@ def evaluate_dataset(
             pid = batch["patient_id"][i]
             if pid not in patient_counts:
                 patient_counts[pid] = np.zeros(4, dtype=np.float64)
+                sweep_counts[pid] = np.zeros((len(thresholds), 4), dtype=np.float64)
                 patient_dataset[pid] = batch["dataset"][i]
             patient_counts[pid] += counts[i]
+            sweep_counts[pid] += sweep[i]
 
     def _patient_metrics(c: np.ndarray) -> Dict[str, float]:
         tp, fp, fn, tn = c
@@ -251,6 +266,11 @@ def evaluate_dataset(
     # Dice over all pixels pooled together (a single global confusion matrix)
     total = np.sum(list(patient_counts.values()), axis=0) if patient_counts else np.zeros(4)
     metrics["global_dice"] = _patient_metrics(total)["dice"]
+
+    metrics["dice_by_threshold"] = {
+        f"{t:.2f}": float(np.mean([_patient_metrics(c[j])["dice"] for c in sweep_counts.values()]))
+        for j, t in enumerate(thresholds)
+    } if sweep_counts else {}
 
     metrics["lesion_dice"] = 100.0 * float(np.mean(slice_dices)) if slice_dices else 0.0
     metrics["lesion_count"] = len(slice_dices)
@@ -292,14 +312,18 @@ def train(
               f"unlabeled: {s['unlabeled_patients']} patients / {s['unlabeled_slices']} slices")
 
     # 2. Build Model & Loss
-    model = DTCR_UNet(
+    cfg.in_channels = train_loader.dataset.num_channels
+    model = build_model(
+        cfg.arch,
         in_channels=cfg.in_channels,
         n_classes=cfg.n_classes,
-        bilinear=cfg.bilinear,
+        pretrained=cfg.pretrained,
         base_c=cfg.base_channels,
         num_stages=cfg.num_stages,
+        bilinear=cfg.bilinear,
     ).to(device)
-    print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters (paper Table 1: 18.65M)")
+    print(f"Model: {cfg.arch} | {cfg.in_channels} input channel(s) | "
+          f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters (paper Table 1: 18.65M)")
 
     criterion = DTCRTotalLoss(
         lambda1=cfg.lambda1,
@@ -314,7 +338,15 @@ def train(
         dice_mode=cfg.dice_mode,
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # Pretrained encoder layers learn more slowly than the freshly initialised rest (standard fine-tuning).
+    pretrained_prefixes = ("stem1.", "layer1.", "layer2.", "layer3.", "layer4.")
+    is_pretrained = cfg.arch == "dtcr_resnet34" and cfg.pretrained
+    enc = [p for n, p in model.named_parameters() if is_pretrained and n.startswith(pretrained_prefixes)]
+    rest = [p for n, p in model.named_parameters() if not (is_pretrained and n.startswith(pretrained_prefixes))]
+    groups = [{"params": rest, "lr": cfg.lr}]
+    if enc:
+        groups.append({"params": enc, "lr": cfg.lr * cfg.encoder_lr_mult})
+    optimizer = optim.AdamW(groups, lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     warmup_epochs = min(5, max(cfg.epochs - 1, 0))
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(cfg.epochs - warmup_epochs, 1), eta_min=cfg.min_lr)
@@ -362,6 +394,7 @@ def train(
             use_amp=use_amp,
             fuse_val=cfg.fuse_val,
             threshold=cfg.val_threshold,
+            tta=cfg.tta,
         )
         scheduler.step()
         elapsed = time.time() - t0
@@ -391,7 +424,7 @@ def train(
 
         per_ds = " ".join(
             f"{k[5:]}={v:.1f}" for k, v in sorted(val_metrics.items())
-            if k.startswith("dice_") and k != "dice_std"
+            if k.startswith("dice_") and isinstance(v, float) and k != "dice_std"
         )
         flags = ("  [best loss]" if is_best_loss else "") + ("  [best dice]" if is_best_dice else "")
         skipped = f" | skipped {train_losses['_skipped_batches']}" if train_losses["_skipped_batches"] else ""
@@ -430,6 +463,33 @@ def train(
         f"\nTraining complete. Lowest val loss {best_val_loss:.4f} (patient Dice {dice_at_best_loss:.2f}%, "
         f"saved as best_model.pth) | highest patient Dice {best_val_dice:.2f}% (best_dice_model.pth)"
     )
+    calibrate_thresholds(cfg, val_loader, device, use_amp)
+
+
+def calibrate_thresholds(cfg: DTCRConfig, val_loader, device: torch.device, use_amp: bool) -> None:
+    """Choose each saved checkpoint's binarization threshold on the VALIDATION set.
+
+    The threshold with the highest validation patient-level Dice (with the same
+    TTA setting used at test time) is stored in the checkpoint as
+    `best_threshold`; evaluate.py uses it by default. Test data is never involved.
+    """
+    for name in ("best_model", "best_dice_model"):
+        path = os.path.join(cfg.checkpoint_dir, f"{name}.pth")
+        if not os.path.exists(path):
+            continue
+        model, ckpt = load_model_from_checkpoint(path, device)
+        m = evaluate_dataset(model, val_loader, device, use_amp=use_amp, fuse_val=cfg.fuse_val,
+                             threshold=cfg.val_threshold, tta=cfg.tta)
+        by_t = m["dice_by_threshold"]
+        best_t = max(by_t, key=by_t.get)
+        ckpt["best_threshold"] = float(best_t)
+        ckpt["tta"] = cfg.tta
+        ckpt["val_dice_at_best_threshold"] = by_t[best_t]
+        torch.save(ckpt, path)
+        sweep = " ".join(f"{t}:{d:.1f}" for t, d in by_t.items())
+        print(f"{name}: validation threshold {best_t} -> patient Dice {by_t[best_t]:.2f}% "
+              f"(at {cfg.val_threshold:.2f}: {m['dice']:.2f}%) | sweep {sweep}")
+        del model
 
 
 def main():
@@ -446,6 +506,10 @@ def main():
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
     parser.add_argument("--consistency-weight", type=float, default=1.0, help="Maximum of the consistency ramp lambda_d(t) (default: 1.0 per Eq. 10)")
+    parser.add_argument("--arch", default="dtcr", choices=["dtcr", "dtcr_resnet34"], help="dtcr: paper network; dtcr_resnet34: same design on an ImageNet-pretrained ResNet-34 encoder")
+    parser.add_argument("--no-pretrained", action="store_true", help="Do not load ImageNet weights for dtcr_resnet34")
+    parser.add_argument("--encoder-lr-mult", type=float, default=0.1, help="Learning-rate factor for the pretrained encoder (default: 0.1)")
+    parser.add_argument("--no-tta", action="store_true", help="Disable horizontal-flip test-time augmentation during validation")
     parser.add_argument("--bce-weight", type=float, default=0.0, help="BCE loss weight (default: 0.0 for pure Soft Dice per Eq. 8; >0 for compound loss)")
     parser.add_argument("--dice-mode", default="hybrid", choices=["batch", "slice", "hybrid"], help="Dice aggregation over a batch (default: hybrid; see losses/seg_loss.py)")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Dice loss weight (default: 1.0 matching Eq. 8 & 10)")
@@ -482,6 +546,10 @@ def main():
         pos_weight=args.pos_weight,
         use_focal=args.use_focal,
         num_stages=args.num_stages,
+        arch=args.arch,
+        pretrained=not args.no_pretrained,
+        encoder_lr_mult=args.encoder_lr_mult,
+        tta=not args.no_tta,
         fuse_val=args.fuse_val and not args.no_fuse_val,
         val_threshold=args.val_threshold,
         num_workers=args.num_workers,

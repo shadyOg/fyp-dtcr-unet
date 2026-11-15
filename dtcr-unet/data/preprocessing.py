@@ -210,6 +210,58 @@ def contrast_report(contrast_by_case: Dict[str, Optional[float]]) -> Dict:
     }
 
 
+def lung_bbox(
+    ct_zyx: np.ndarray,
+    mask_zyx: np.ndarray,
+    slice_indices: List[int],
+    margin: float = 0.08,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Square in-plane box (y0, y1, x0, x1) around both lungs over the given slices.
+
+    Lungs are the air (< -400 HU) regions that do not touch the image border;
+    outside air does. The box is widened to contain every annotated lesion, padded
+    by `margin`, and made square so the later resize keeps the aspect ratio.
+    Cropping before resizing to 256 x 256 spends the pixels on the lungs instead of
+    the table and the air around the patient: small lesions get larger on the input.
+
+    Returns None (keep the full slice) when no plausible lung region is found or
+    the volume is not in Hounsfield Units.
+    """
+    from scipy.ndimage import label
+
+    if not volume_is_hu(ct_zyx):
+        return None
+    h, w = ct_zyx.shape[1:]
+    proj = np.zeros((h, w), dtype=bool)
+    for z in slice_indices:
+        lab, n = label(ct_zyx[z] < -400)
+        if n == 0:
+            continue
+        border = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+        inside = ~np.isin(lab, border) & (lab > 0)
+        proj |= inside
+
+    lab, n = label(proj)
+    if n == 0:
+        return None
+    areas = np.bincount(lab.ravel())[1:]
+    keep = np.isin(lab, np.nonzero(areas >= 0.1 * areas.max())[0] + 1)
+    if keep.sum() < 0.01 * h * w:
+        return None
+
+    lesion = mask_zyx[slice_indices].any(axis=0)
+    region = keep | lesion
+    ys, xs = np.nonzero(region)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+
+    side = int(round(max(y1 - y0, x1 - x0) * (1.0 + 2.0 * margin)))
+    side = min(max(side, 32), h, w)
+    cy, cx = (y0 + y1) / 2.0, (x0 + x1) / 2.0
+    ty = int(round(min(max(cy - side / 2.0, 0), h - side)))
+    tx = int(round(min(max(cx - side / 2.0, 0), w - side)))
+    return ty, ty + side, tx, tx + side
+
+
 def save_case_slices(
     ct_zyx: np.ndarray,
     mask_zyx: np.ndarray,
@@ -217,27 +269,43 @@ def save_case_slices(
     stem_prefix: str,
     split_dir: Path,
     target_size: Tuple[int, int],
-) -> Tuple[int, int]:
+    in_slices: int = 3,
+    crop_lungs: bool = True,
+) -> Tuple[int, int, Optional[float]]:
     """Preprocess and save the selected slices of one case.
+
+    Each saved image is (in_slices, H, W) float16: the slice itself in the centre
+    channel and its neighbours above and below (2.5D input, standard for CT), so
+    the network sees some through-plane context. The mask is the centre slice's.
 
     Returns:
         (slices saved, slices that contain lesion pixels, median lesion contrast or None).
     """
     is_hu = volume_is_hu(ct_zyx)
+    num_slices = ct_zyx.shape[0]
+    box = lung_bbox(ct_zyx, mask_zyx, slice_indices) if crop_lungs else None
+    y0, y1, x0, x1 = box if box else (0, ct_zyx.shape[1], 0, ct_zyx.shape[2])
+    half = in_slices // 2
+
     saved, with_lesion = 0, 0
     contrasts = []
     for idx in slice_indices:
-        ct_resized = resize_slice(normalize_ct_slice(ct_zyx[idx], is_hu=is_hu), target_size, is_mask=False)
-        mask_resized = resize_slice(mask_zyx[idx], target_size, is_mask=True)
+        channels = []
+        for off in range(-half, half + 1):
+            z = min(max(idx + off, 0), num_slices - 1)
+            sl = normalize_ct_slice(ct_zyx[z, y0:y1, x0:x1], is_hu=is_hu)
+            channels.append(resize_slice(sl, target_size, is_mask=False))
+        image = np.stack(channels, axis=0)
+        mask_resized = resize_slice(mask_zyx[idx, y0:y1, x0:x1], target_size, is_mask=True)
         lsf_map = compute_level_set(mask_resized)
 
         stem = f"{stem_prefix}_s{idx}"
-        np.save(split_dir / "images" / f"{stem}.npy", ct_resized.astype(np.float32))
+        np.save(split_dir / "images" / f"{stem}.npy", image.astype(np.float16))
         np.save(split_dir / "masks" / f"{stem}.npy", mask_resized.astype(np.uint8))
-        np.save(split_dir / "level_sets" / f"{stem}.npy", lsf_map)
+        np.save(split_dir / "level_sets" / f"{stem}.npy", lsf_map.astype(np.float16))
         saved += 1
         with_lesion += int(mask_resized.any())
-        c = lesion_contrast(ct_resized, mask_resized)
+        c = lesion_contrast(image[half].astype(np.float32), mask_resized)
         if c is not None:
             contrasts.append(c)
     return saved, with_lesion, (float(np.median(contrasts)) if contrasts else None)

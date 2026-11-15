@@ -94,6 +94,56 @@ def compute_binary_metrics(
     }
 
 
+def predict_probs(model: torch.nn.Module, images: torch.Tensor, tta: bool = False, fuse: bool = False):
+    """Run the model and return (raw outputs, lesion probability map).
+
+    Args:
+        tta: Average with the prediction on the horizontally flipped image.
+        fuse: Average the segmentation head with the inverse-transformed level set head.
+
+    Returns:
+        ((f1_logits, f2_lsf, f2_trans) of the plain forward pass, probabilities (B, 1, H, W) float32).
+    """
+    outputs = model(images)
+    f1_logits, _, f2_trans = outputs
+    seg = torch.sigmoid(f1_logits.float())
+    lsf = f2_trans.float()
+    if tta:
+        fl_logits, _, fl_trans = model(torch.flip(images, dims=[3]))
+        seg = 0.5 * (seg + torch.flip(torch.sigmoid(fl_logits.float()), dims=[3]))
+        lsf = 0.5 * (lsf + torch.flip(fl_trans.float(), dims=[3]))
+    probs = 0.5 * seg + 0.5 * lsf if fuse else seg
+    return outputs, probs
+
+
+def load_model_from_checkpoint(checkpoint_path: str, device: torch.device, num_stages=None):
+    """Rebuild the model a checkpoint was trained with and load its weights.
+
+    Returns:
+        (model in eval mode, checkpoint dict).
+    """
+    from models.dtcr_resnet import build_model
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint))
+    cfg = checkpoint.get("config", {}) if isinstance(checkpoint.get("config", {}), dict) else {}
+    arch = cfg.get("arch", "dtcr")
+    if num_stages is None:
+        num_stages = cfg.get("num_stages", 5 if any("down4" in k for k in state_dict) else 4)
+    model = build_model(
+        arch,
+        in_channels=cfg.get("in_channels", 1),
+        n_classes=cfg.get("n_classes", 1),
+        pretrained=False,  # weights come from the checkpoint
+        base_c=cfg.get("base_channels", 64),
+        num_stages=num_stages,
+        bilinear=cfg.get("bilinear", False),
+    ).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model, checkpoint
+
+
 def save_checkpoint(
     state: dict,
     is_best: bool,

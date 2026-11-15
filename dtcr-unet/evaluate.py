@@ -17,8 +17,7 @@ from tqdm import tqdm
 
 from config import DTCRConfig
 from data.datasets import get_dataloaders
-from models.dtcr_unet import DTCR_UNet
-from utils import compute_binary_metrics
+from utils import compute_binary_metrics, load_model_from_checkpoint, predict_probs
 
 
 def evaluate_checkpoint(
@@ -28,10 +27,11 @@ def evaluate_checkpoint(
     batch_size: int = 16,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     save_visualizations: int = 10,
-    threshold: float = 0.5,
+    threshold: Optional[float] = None,
     fuse_dual_task: bool = False,
     save_predictions: bool = False,
     num_stages: Optional[int] = None,
+    tta: Optional[bool] = None,
 ):
     """Load model checkpoint and run comprehensive test set evaluation."""
     dev = torch.device(device)
@@ -43,22 +43,16 @@ def evaluate_checkpoint(
         os.makedirs(preds_dir, exist_ok=True)
 
     print(f"Loading checkpoint from: {checkpoint_path}")
-    print(f"Evaluation settings: Threshold={threshold} | Dual-Task Fusion={fuse_dual_task}")
-    checkpoint = torch.load(checkpoint_path, map_location=dev, weights_only=False)
-    state_dict = checkpoint.get("model_state", checkpoint.get("model_state_dict", checkpoint))
-
-    # Auto-detect number of stages if not explicitly specified
-    if num_stages is None:
-        cfg = checkpoint.get("config", {})
-        if isinstance(cfg, dict) and "num_stages" in cfg:
-            num_stages = cfg["num_stages"]
-        else:
-            num_stages = 5 if any("down4" in k for k in state_dict.keys()) else 4
-
-    print(f"Model architecture: {num_stages}-stage DTCR-U-Net")
-    model = DTCR_UNet(in_channels=1, n_classes=1, num_stages=num_stages).to(dev)
-    model.load_state_dict(state_dict)
-    model.eval()
+    model, checkpoint = load_model_from_checkpoint(checkpoint_path, dev, num_stages=num_stages)
+    cfg = checkpoint.get("config", {})
+    # Defaults come from the checkpoint: threshold and TTA chosen on the validation set.
+    if threshold is None:
+        threshold = float(checkpoint.get("best_threshold", 0.5))
+    if tta is None:
+        tta = bool(checkpoint.get("tta", False))
+    print(f"Model: {cfg.get('arch', 'dtcr')} | input channels {cfg.get('in_channels', 1)} | "
+          f"epoch {checkpoint.get('epoch', '?')}")
+    print(f"Evaluation settings: Threshold={threshold} | TTA={tta} | Dual-Task Fusion={fuse_dual_task}")
 
     _, _, test_loader = get_dataloaders(data_dir=data_dir, batch_size=batch_size)
     print(f"Test samples: {len(test_loader.dataset)}")
@@ -76,15 +70,11 @@ def evaluate_checkpoint(
             patient_ids = batch.get("patient_id", [f"unknown_{batch_idx}_{i}" for i in range(len(images))])
             dataset_names = batch.get("dataset", ["unknown"] * len(images))
 
-            f1_logits, f2_lsf, f2_trans = model(images)
-            f1_probs = torch.sigmoid(f1_logits).cpu().numpy()
-            trans_probs = f2_trans.cpu().numpy()
-            images_np = images.cpu().numpy()
-
-            if fuse_dual_task:
-                probs = 0.5 * f1_probs + 0.5 * trans_probs
-            else:
-                probs = f1_probs
+            (_, _, f2_trans), probs_t = predict_probs(model, images, tta=tta, fuse=fuse_dual_task)
+            probs = probs_t.cpu().numpy()
+            trans_probs = f2_trans.float().cpu().numpy()
+            images_np = images.float().cpu().numpy()
+            centre = images_np.shape[1] // 2   # centre channel = the slice itself (2.5D input)
 
             for i in range(len(probs)):
                 m = compute_binary_metrics(probs[i, 0], masks[i, 0], threshold=threshold)
@@ -105,16 +95,16 @@ def evaluate_checkpoint(
                 # Save qualitative visual comparisons
                 if saved_vis_count < save_visualizations and masks[i, 0].sum() > 0:
                     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-                    axes[0].imshow(images_np[i, 0], cmap="gray")
+                    axes[0].imshow(images_np[i, centre], cmap="gray")
                     axes[0].set_title("CT Slice")
                     axes[0].axis("off")
 
-                    axes[1].imshow(images_np[i, 0], cmap="gray")
+                    axes[1].imshow(images_np[i, centre], cmap="gray")
                     axes[1].imshow(masks[i, 0], cmap="Reds", alpha=0.4)
                     axes[1].set_title("Ground Truth Mask")
                     axes[1].axis("off")
 
-                    axes[2].imshow(images_np[i, 0], cmap="gray")
+                    axes[2].imshow(images_np[i, centre], cmap="gray")
                     axes[2].imshow(probs[i, 0] > threshold, cmap="Greens", alpha=0.4)
                     axes[2].set_title(f"DTCR-U-Net Pred (Dice: {m['dice']:.1f}%)")
                     axes[2].axis("off")
@@ -194,6 +184,8 @@ def evaluate_checkpoint(
         dataset_summary[ds] = {"dice_mean": float(np.mean(vals)), "dice_std": float(np.std(vals)), "patients": len(vals)}
 
     full_results = {
+        "threshold": threshold,
+        "tta": tta,
         "patient_level_by_dataset": dataset_summary,
         "slice_level_all": slice_summary,
         "slice_level_lesion_only": lesion_summary,
@@ -242,7 +234,9 @@ def main():
     parser.add_argument("--data", default="data/processed", help="Path to preprocessed dataset")
     parser.add_argument("--out", default="outputs/evaluation", help="Output directory for results")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold (default: 0.5)")
+    parser.add_argument("--threshold", type=float, default=None, help="Binarization threshold (default: the one chosen on validation, stored in the checkpoint; 0.5 for older checkpoints)")
+    parser.add_argument("--tta", dest="tta", action="store_true", default=None, help="Force horizontal-flip test-time augmentation on")
+    parser.add_argument("--no-tta", dest="tta", action="store_false", help="Force test-time augmentation off")
     parser.add_argument("--fuse-dual-task", action="store_true", help="Ensemble Task 1 (Dice head) and Task 2 (Level Set inverse mapping)")
     parser.add_argument("--save-vis", type=int, default=20, help="Number of qualitative comparisons to save (0 to disable)")
     parser.add_argument("--save-predictions", action="store_true", help="Save binary prediction masks as .npy files")
@@ -259,6 +253,7 @@ def main():
         fuse_dual_task=args.fuse_dual_task,
         save_predictions=args.save_predictions,
         num_stages=args.num_stages,
+        tta=args.tta,
     )
 
 
