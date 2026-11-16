@@ -54,7 +54,7 @@ def evaluate_checkpoint(
           f"epoch {checkpoint.get('epoch', '?')}")
     print(f"Evaluation settings: Threshold={threshold} | TTA={tta} | Dual-Task Fusion={fuse_dual_task}")
 
-    _, _, test_loader = get_dataloaders(data_dir=data_dir, batch_size=batch_size)
+    _, _, test_loader = get_dataloaders(data_dir=data_dir, batch_size=batch_size, image_size=cfg.get("image_size"))
     print(f"Test samples: {len(test_loader.dataset)}")
 
     metrics_list = []

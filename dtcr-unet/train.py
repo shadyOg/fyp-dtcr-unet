@@ -293,7 +293,7 @@ def train(
     """Main training execution function."""
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
-    print(f"Using device: {device} | AMP Mixed Precision: {use_amp}")
+    print(f"Using device: {device} | AMP Mixed Precision: {use_amp} | input size: {cfg.image_size or 'as saved'}")
 
     # 1. Prepare DataLoaders
     train_loader, val_loader, _ = get_dataloaders(
@@ -303,7 +303,9 @@ def train(
         labeled_ratio=cfg.labeled_ratio,
         seed=cfg.seed,
         filter_empty_val=filter_empty_val,
+        image_size=cfg.image_size,
     )
+    cfg.image_size = int(train_loader.dataset[0]["image"].shape[-1])   # record the size actually used
     print(f"Data ready: {len(train_loader.dataset)} train slices, {len(val_loader.dataset)} val slices, "
           f"{len(train_loader)} iterations/epoch (batch {cfg.batch_size} x accum {grad_accum_steps}).")
     print(f"Semi-supervised split (labeled ratio {cfg.labeled_ratio}):")
@@ -506,6 +508,7 @@ def main():
     parser.add_argument("--lambda2", type=float, default=1.0, help="Interaction enhancement weight for L_DTC (default: 1.0 per paper Section 4.6)")
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
     parser.add_argument("--consistency-weight", type=float, default=1.0, help="Maximum of the consistency ramp lambda_d(t) (default: 1.0 per Eq. 10)")
+    parser.add_argument("--image-size", type=int, default=None, help="Train at this input size (resized on load); default: the preprocessed size")
     parser.add_argument("--arch", default="dtcr", choices=["dtcr", "dtcr_resnet34"], help="dtcr: paper network; dtcr_resnet34: same design on an ImageNet-pretrained ResNet-34 encoder")
     parser.add_argument("--no-pretrained", action="store_true", help="Do not load ImageNet weights for dtcr_resnet34")
     parser.add_argument("--encoder-lr-mult", type=float, default=0.1, help="Learning-rate factor for the pretrained encoder (default: 0.1)")
@@ -547,6 +550,7 @@ def main():
         use_focal=args.use_focal,
         num_stages=args.num_stages,
         arch=args.arch,
+        image_size=args.image_size,
         pretrained=not args.no_pretrained,
         encoder_lr_mult=args.encoder_lr_mult,
         tta=not args.no_tta,

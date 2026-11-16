@@ -4,6 +4,7 @@ Hyperparameters match the experimental protocol from Section 4 of the DTCR-U-Net
 """
 
 from dataclasses import dataclass
+from typing import Optional
 import torch
 
 
@@ -11,7 +12,7 @@ import torch
 class DTCRConfig:
     # Data parameters
     data_dir: str = "data/processed"
-    image_size: int = 256
+    image_size: Optional[int] = None  # train at this size (resized on load); None = the preprocessed size
     context_slices: int = 2       # 2 adjacent slices above and below (5 slices total) per Section 4.1 line 849
     num_workers: int = 2
     labeled_ratio: float = 0.4    # 40% labeled, 60% unlabeled for semi-supervised training per Section 4.2

@@ -4,7 +4,7 @@ import math
 import random
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -41,6 +41,7 @@ class DualTaskDataset(Dataset):
         labeled_ratio: float = 1.0,
         seed: int = 42,
         only_lesion_slices: bool = False,
+        image_size: Optional[int] = None,
     ):
         """
         Args:
@@ -51,10 +52,14 @@ class DualTaskDataset(Dataset):
                 drawn separately inside each source dataset.
             seed: Random seed for selecting labeled vs unlabeled patients.
             only_lesion_slices: If True, keep only slices with positive ground truth masks.
+            image_size: Resize samples to image_size x image_size on load (None: keep the
+                saved size). Lets several models share one preprocessing run at a high
+                resolution while each trains at its own input size.
         """
         self.data_dir = Path(data_dir) / split
         self.split = split
         self.transform = transform and (split == "train")
+        self.image_size = image_size
 
         self.img_paths = sorted(glob(str(self.data_dir / "images" / "*.npy")))
         if len(self.img_paths) == 0:
@@ -107,6 +112,22 @@ class DualTaskDataset(Dataset):
         return len(self.img_paths)
 
     @staticmethod
+    def _resize(img: np.ndarray, mask: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Resize a (C, H, W) image and its (H, W) mask to size x size.
+
+        Shrinking uses area averaging; the mask keeps pixels at least half covered by
+        lesion, the same rule as preprocessing, so lesion area stays unbiased.
+        """
+        shrinking = img.shape[1] > size
+        interp = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+        img = np.stack([cv2.resize(c, (size, size), interpolation=interp) for c in img], axis=0)
+        if shrinking:
+            mask = (cv2.resize(mask, (size, size), interpolation=cv2.INTER_AREA) >= 0.5).astype(np.float32)
+        else:
+            mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_NEAREST)
+        return img.astype(np.float32), mask.astype(np.float32)
+
+    @staticmethod
     def _hwc(arr: np.ndarray) -> np.ndarray:
         """cv2 drops the channel axis of single-channel images: put it back."""
         return arr[..., None] if arr.ndim == 2 else arr
@@ -125,17 +146,17 @@ class DualTaskDataset(Dataset):
             img = img[:, ::-1]
             mask = mask[:, ::-1]
 
-        # 2. Small rotation (+/- 10 degrees)
+        # 2. Rotation (+/- 15 degrees)
         if random.random() > 0.5:
-            rot_mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), random.uniform(-10.0, 10.0), scale=1.0)
+            rot_mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), random.uniform(-15.0, 15.0), scale=1.0)
             img = self._hwc(cv2.warpAffine(np.ascontiguousarray(img), rot_mat, (w, h), flags=cv2.INTER_LINEAR,
                                            borderMode=cv2.BORDER_CONSTANT, borderValue=0.0))
             mask = cv2.warpAffine(np.ascontiguousarray(mask), rot_mat, (w, h), flags=cv2.INTER_NEAREST,
                                   borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
 
-        # 3. Random scale, then centre crop / pad back to size (zoom 0.9x to 1.1x)
+        # 3. Random scale, then centre crop / pad back to size (zoom 0.85x to 1.2x)
         if random.random() > 0.5:
-            scale = random.uniform(0.90, 1.10)
+            scale = random.uniform(0.85, 1.20)
             new_h, new_w = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
             img_s = self._hwc(cv2.resize(np.ascontiguousarray(img), (new_w, new_h), interpolation=cv2.INTER_LINEAR))
             mask_s = cv2.resize(np.ascontiguousarray(mask), (new_w, new_h), interpolation=cv2.INTER_NEAREST)
@@ -149,9 +170,14 @@ class DualTaskDataset(Dataset):
                 img = np.pad(img_s, pad + ((0, 0),), mode="constant", constant_values=0)
                 mask = np.pad(mask_s, pad, mode="constant", constant_values=0)
 
-        # 4. Mild gamma jitter (scanner / reconstruction variability)
+        # 4. Intensity: gamma, contrast / brightness, light noise (scanner and reconstruction variability)
         if random.random() > 0.5:
-            img = np.clip(img, 0.0, 1.0) ** random.uniform(0.85, 1.15)
+            img = np.clip(img, 0.0, 1.0) ** random.uniform(0.8, 1.25)
+        if random.random() > 0.5:
+            img = img * random.uniform(0.9, 1.1) + random.uniform(-0.05, 0.05)
+        if random.random() > 0.7:
+            img = img + np.random.normal(0.0, 0.02, img.shape).astype(np.float32)
+        img = np.clip(img, 0.0, 1.0)
 
         return np.ascontiguousarray(img, dtype=np.float32), np.ascontiguousarray(mask, dtype=np.float32)
 
@@ -170,6 +196,9 @@ class DualTaskDataset(Dataset):
             mask = (np.load(mask_path) > 0).astype(np.float32)
         else:
             mask = np.zeros((h, w), dtype=np.float32)
+
+        if self.image_size and (h, w) != (self.image_size, self.image_size):
+            img, mask = self._resize(img, mask, self.image_size)
 
         if self.transform:
             img_hwc, mask = self._augment(np.transpose(img, (1, 2, 0)), mask)
@@ -252,6 +281,7 @@ def get_dataloaders(
     labeled_ratio: float = 1.0,
     seed: int = 42,
     filter_empty_val: bool = False,
+    image_size: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Create Train, Val, and Test DataLoaders.
 
@@ -265,18 +295,21 @@ def get_dataloaders(
         transform=True,
         labeled_ratio=labeled_ratio,
         seed=seed,
+        image_size=image_size,
     )
     val_ds = DualTaskDataset(
         data_dir=data_dir,
         split="val",
         transform=False,
         only_lesion_slices=filter_empty_val,
+        image_size=image_size,
     )
     test_ds = DualTaskDataset(
         data_dir=data_dir,
         split="test",
         transform=False,
         only_lesion_slices=False,
+        image_size=image_size,
     )
 
     labeled_idxs = [i for i, lab in enumerate(train_ds.is_labeled_list) if lab]
