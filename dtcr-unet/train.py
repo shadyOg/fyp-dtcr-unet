@@ -22,7 +22,7 @@ from config import DTCRConfig
 from data.datasets import get_dataloaders
 from losses.dtc_loss import DTCRTotalLoss
 from models.dtcr_resnet import build_model
-from utils import load_model_from_checkpoint, predict_probs, save_checkpoint
+from utils import choose_threshold, load_model_from_checkpoint, predict_probs, save_checkpoint
 
 LOSS_KEYS = ("loss_total", "loss_seg", "loss_lsf", "loss_dtc", "l_main", "l_grad", "l_interact")
 SWEEP_THRESHOLDS = tuple(round(0.10 + 0.05 * i, 2) for i in range(17))   # 0.10 ... 0.90
@@ -483,7 +483,7 @@ def calibrate_thresholds(cfg: DTCRConfig, val_loader, device: torch.device, use_
         m = evaluate_dataset(model, val_loader, device, use_amp=use_amp, fuse_val=cfg.fuse_val,
                              threshold=cfg.val_threshold, tta=cfg.tta)
         by_t = m["dice_by_threshold"]
-        best_t = max(by_t, key=by_t.get)
+        best_t = choose_threshold(by_t)
         ckpt["best_threshold"] = float(best_t)
         ckpt["tta"] = cfg.tta
         ckpt["val_dice_at_best_threshold"] = by_t[best_t]

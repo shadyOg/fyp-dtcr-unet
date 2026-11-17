@@ -116,6 +116,22 @@ def predict_probs(model: torch.nn.Module, images: torch.Tensor, tta: bool = Fals
     return outputs, probs
 
 
+def choose_threshold(dice_by_threshold: Dict[str, float], low: float = 0.3, high: float = 0.7,
+                     default: float = 0.5, min_gain: float = 0.5) -> str:
+    """Pick a binarization threshold from a validation sweep {"0.50": dice, ...}.
+
+    With only ~30 validation patients the sweep is noisy, so the choice is kept
+    conservative: only thresholds in [low, high] are considered, and the default
+    (0.5) is kept unless another value beats it by more than `min_gain` Dice points.
+    """
+    candidates = {t: d for t, d in dice_by_threshold.items() if low - 1e-9 <= float(t) <= high + 1e-9}
+    if not candidates:
+        return max(dice_by_threshold, key=dice_by_threshold.get)
+    default_key = min(candidates, key=lambda t: abs(float(t) - default))
+    best_key = max(candidates, key=candidates.get)
+    return best_key if candidates[best_key] > candidates[default_key] + min_gain else default_key
+
+
 def load_model_from_checkpoint(checkpoint_path: str, device: torch.device, num_stages=None):
     """Rebuild the model a checkpoint was trained with and load its weights.
 

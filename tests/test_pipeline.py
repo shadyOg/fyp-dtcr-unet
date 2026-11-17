@@ -209,6 +209,26 @@ def test_lidc_processing():
         manifest = process_lidc_dataset(str(root), str(out), target_size=(64, 64), max_patients=5, context_slices=2)
         assert manifest["low_contrast_cases"] == ["lidc_LIDC-IDRI-0003"], manifest["low_contrast_cases"]
 
+    # Extra training patients must not change which patients are in validation and test
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "lidc"
+        for i in range(1, 13):
+            _write_lidc_patient(root, f"LIDC-IDRI-{i:04d}", rng, with_nodule=(i != 4))
+
+        def split_patients(out):
+            return {split: sorted({p.stem.rsplit("_s", 1)[0] for p in (out / split / "images").glob("*.npy")})
+                    for split in ("train", "val", "test")}
+
+        base = Path(tmp) / "base"
+        process_lidc_dataset(str(root), str(base), target_size=(32, 32), max_patients=6, context_slices=1)
+        more = Path(tmp) / "more"
+        m = process_lidc_dataset(str(root), str(more), target_size=(32, 32), max_patients=6, context_slices=1,
+                                 extra_train_patients=4)
+        a, b = split_patients(base), split_patients(more)
+        assert a["val"] == b["val"] and a["test"] == b["test"], (a, b)
+        assert set(a["train"]) < set(b["train"]) and len(b["train"]) == len(a["train"]) + 4, (a, b)
+        assert m["extra_train_patients"] == 4 and m["cases"]["train"] == len(b["train"])
+
 
 def test_end_to_end_pipeline():
     rng = np.random.default_rng(1)
@@ -358,6 +378,23 @@ def test_end_to_end_pipeline():
         )
         assert results_r["total_patients"] == 3
         assert torch.load(tmp / "ckpt_r" / "best_dice_model.pth", weights_only=False)["config"]["arch"] == "dtcr_resnet34"
+
+        # Ensemble of the two models, each at a different input size, scored at full resolution
+        cfg_s = DTCRConfig(
+            data_dir=str(out), epochs=1, batch_size=4, num_workers=0, labeled_ratio=1.0,
+            checkpoint_dir=str(tmp / "ckpt_s"), output_dir=str(tmp / "outputs_s"), device="cpu",
+            image_size=32,
+        )
+        train(cfg_s, grad_accum_steps=1, use_amp=False)
+        assert torch.load(tmp / "ckpt_s" / "best_model.pth", weights_only=False)["config"]["image_size"] == 32
+        from ensemble import run_ensemble
+        ens = run_ensemble([str(tmp / "ckpt_r" / "best_model.pth"), str(tmp / "ckpt_s" / "best_model.pth")],
+                           str(out), str(tmp / "ens"), batch_size=4, device="cpu", num_workers=0)
+        assert set(ens) == {"ckpt_r/best_model", "ckpt_s/best_model", "ensemble"}, set(ens)
+        for name, r in ens.items():
+            assert 0.3 <= r["threshold"] <= 0.7, (name, r["threshold"])
+            assert len(r["test"]["patients"]) == 3 and set(r["test"]["by_dataset"]) == {"mosmed", "covid19"}
+        assert (tmp / "ens" / "ensemble_metrics.json").exists()
 
     print("Pipeline tests passed.")
 

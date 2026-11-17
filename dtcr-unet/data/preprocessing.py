@@ -657,6 +657,7 @@ def process_lidc_dataset(
     val_ratio: float = 0.2,
     labeled_ratio: float = 1.0,  # unused: the labeled subset is chosen at training time
     seed: int = 42,
+    extra_train_patients: int = 0,
 ) -> Dict:
     """Extract and preprocess LIDC-IDRI from raw DICOM + XML annotations.
 
@@ -674,7 +675,13 @@ def process_lidc_dataset(
       4. Reorient to LPS, keep nodule slices (+context), window, CLAHE, resize, save
 
     `max_patients` counts patients that actually yield annotated nodules, so the
-    requested number of usable cases is reached whenever the data allows it.
+    requested number of usable cases is reached whenever the data allows it. These
+    are split 6:2:2.
+
+    `extra_train_patients` collects that many further usable patients (continuing in
+    the same seeded order) and puts them all in the training split. The first
+    `max_patients` and their split are exactly the same as without extras, so the
+    validation and test patients do not change and results stay comparable.
     """
     import SimpleITK as sitk
     import pydicom
@@ -742,7 +749,7 @@ def process_lidc_dataset(
 
     pbar = tqdm(order, desc="Processing LIDC-IDRI patients")
     for patient_dir in pbar:
-        if max_patients > 0 and len(kept_ids) >= max_patients:
+        if max_patients > 0 and len(kept_ids) >= max_patients + max(extra_train_patients, 0):
             break
         patient_id = patient_dir.name
         try:
@@ -807,7 +814,10 @@ def process_lidc_dataset(
         print("  ERROR: no LIDC-IDRI patient produced annotated nodule slices.")
         return {}
 
-    split_lookup = split_cases(kept_ids, test_ratio, val_ratio, seed)
+    core_ids = kept_ids[:max_patients] if max_patients > 0 else kept_ids
+    extra_ids = kept_ids[len(core_ids):]
+    split_lookup = split_cases(core_ids, test_ratio, val_ratio, seed)
+    split_lookup.update({pid: "train" for pid in extra_ids})
     for patient_id in kept_ids:
         split_name = split_lookup[patient_id]
         staging = staging_root / patient_id
@@ -825,6 +835,7 @@ def process_lidc_dataset(
         "target_size": list(target_size),
         "context_slices": context_slices,
         "cases": case_counts,
+        "extra_train_patients": len(extra_ids),
         "slices": counts,
         "slices_with_lesion": lesion_counts,
         "skipped": skipped,
@@ -849,6 +860,7 @@ def main():
     parser.add_argument("--context", type=int, default=2, help="Adjacent slices kept above and below each lesion slice (Section 4.1)")
     parser.add_argument("--labeled-ratio", type=float, default=None, help="Ignored (kept for old commands): pass --labeled-ratio to train.py instead")
     parser.add_argument("--max-patients", type=int, default=100, help="Number of usable LIDC patients to collect (default: 100)")
+    parser.add_argument("--extra-lidc-train", type=int, default=0, help="Further usable LIDC patients added to the training split only (val/test unchanged)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
@@ -860,7 +872,8 @@ def main():
         process_mosmed_dataset(args.mosmed, args.out, target_size=size, context_slices=args.context, seed=args.seed)
     if args.lidc:
         process_lidc_dataset(args.lidc, args.out, target_size=size, max_patients=args.max_patients,
-                             context_slices=args.context, seed=args.seed)
+                             context_slices=args.context, seed=args.seed,
+                             extra_train_patients=args.extra_lidc_train)
     if args.covid19:
         process_covid19_dataset(args.covid19, args.out, target_size=size, context_slices=args.context, seed=args.seed)
 
