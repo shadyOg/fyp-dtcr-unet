@@ -383,10 +383,23 @@ def test_end_to_end_pipeline():
         cfg_s = DTCRConfig(
             data_dir=str(out), epochs=1, batch_size=4, num_workers=0, labeled_ratio=1.0,
             checkpoint_dir=str(tmp / "ckpt_s"), output_dir=str(tmp / "outputs_s"), device="cpu",
-            image_size=32,
+            image_size=32, ema_decay=0.9, balance_power=1.0,
         )
         train(cfg_s, grad_accum_steps=1, use_amp=False)
-        assert torch.load(tmp / "ckpt_s" / "best_model.pth", weights_only=False)["config"]["image_size"] == 32
+        ck_s = torch.load(tmp / "ckpt_s" / "best_model.pth", weights_only=False)
+        assert ck_s["config"]["image_size"] == 32 and ck_s["config"]["ema_decay"] == 0.9
+        assert not any(k.startswith("module.") or k == "n_averaged" for k in ck_s["model_state"]), "EMA wrapper leaked into the checkpoint"
+
+        # Dataset-balanced sampling: with p = 1 both source datasets are drawn about equally often
+        from collections import Counter
+        bal_loader, _, _ = get_dataloaders(out, batch_size=4, num_workers=0, labeled_ratio=1.0, balance_power=1.0)
+        nat = Counter(bal_loader.dataset.datasets)
+        drawn = Counter()
+        for _ in range(30):
+            for b in bal_loader:
+                drawn.update(b["dataset"])
+        share = drawn["covid19"] / sum(drawn.values())
+        assert nat["covid19"] / sum(nat.values()) < 0.4 and 0.4 < share < 0.6, (nat, drawn)
         from ensemble import run_ensemble
         ens = run_ensemble([str(tmp / "ckpt_r" / "best_model.pth"), str(tmp / "ckpt_s" / "best_model.pth")],
                            str(out), str(tmp / "ens"), batch_size=4, device="cpu", num_workers=0)

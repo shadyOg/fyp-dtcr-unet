@@ -44,6 +44,8 @@ class DTCRConfig:
     pretrained: bool = True       # load ImageNet weights for dtcr_resnet34
     encoder_lr_mult: float = 0.1  # learning-rate factor for the pretrained encoder
     tta: bool = True              # horizontal-flip test-time augmentation at validation / test
+    ema_decay: float = 0.0        # exponential moving average of weights (e.g. 0.999); 0 = off
+    balance_power: float = 0.0    # dataset-balanced sampling: weight n_dataset^-p (0 = off, 1 = equal)
     in_channels: int = 1
     n_classes: int = 1
     base_channels: int = 64

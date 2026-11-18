@@ -46,8 +46,12 @@ def train_one_epoch(
     max_epochs: int,
     grad_accum_steps: int = 1,
     use_amp: bool = True,
+    ema=None,
 ) -> dict:
-    """Run one epoch of training with AMP and gradient accumulation."""
+    """Run one epoch of training with AMP and gradient accumulation.
+
+    `ema` (a torch.optim.swa_utils.AveragedModel) is updated after every optimizer step.
+    """
     model.train()
     running = {k: 0.0 for k in LOSS_KEYS}
     total_batches = len(loader)
@@ -94,6 +98,8 @@ def train_one_epoch(
                 if torch.isfinite(grad_norm):
                     scaler.step(optimizer)
                     optimizer_steps += 1
+                    if ema is not None:
+                        ema.update_parameters(model)
                 else:
                     skipped_batches += 1
                 scaler.update()
@@ -105,6 +111,8 @@ def train_one_epoch(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_steps += 1
+                if ema is not None:
+                    ema.update_parameters(model)
 
         for k in LOSS_KEYS:
             running[k] += loss_dict[k]
@@ -304,6 +312,7 @@ def train(
         seed=cfg.seed,
         filter_empty_val=filter_empty_val,
         image_size=cfg.image_size,
+        balance_power=cfg.balance_power,
     )
     cfg.image_size = int(train_loader.dataset[0]["image"].shape[-1])   # record the size actually used
     print(f"Data ready: {len(train_loader.dataset)} train slices, {len(val_loader.dataset)} val slices, "
@@ -360,6 +369,16 @@ def train(
 
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device.type == "cuda")
 
+    # Exponential moving average of the weights (also of BatchNorm statistics). Validation,
+    # checkpoints and therefore test evaluation use the averaged weights: a smoothed model
+    # that is less sensitive to the last few noisy updates and to early overfitting.
+    ema = None
+    if cfg.ema_decay > 0:
+        from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+        ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(cfg.ema_decay), use_buffers=True)
+        print(f"EMA of weights enabled (decay {cfg.ema_decay}); evaluation and checkpoints use the averaged model.")
+    eval_model = ema.module if ema is not None else model
+
     best_val_loss = float("inf")
     best_val_dice = -1.0
     dice_at_best_loss = 0.0
@@ -386,10 +405,11 @@ def train(
             max_epochs=cfg.epochs,
             grad_accum_steps=grad_accum_steps,
             use_amp=use_amp,
+            ema=ema,
         )
 
         val_metrics = evaluate_dataset(
-            model=model,
+            model=eval_model,
             loader=val_loader,
             device=device,
             criterion=criterion,
@@ -447,7 +467,7 @@ def train(
 
         state = {
             "epoch": epoch + 1,
-            "model_state": model.state_dict(),
+            "model_state": eval_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "best_val_dice": best_val_dice,
             "best_val_loss": best_val_loss,
@@ -509,6 +529,8 @@ def main():
     parser.add_argument("--lambda-context", type=float, default=0.0, help="Context-guided loss weight (default: 0.0 matching Eq. 4; optional per Eq. 3)")
     parser.add_argument("--consistency-weight", type=float, default=1.0, help="Maximum of the consistency ramp lambda_d(t) (default: 1.0 per Eq. 10)")
     parser.add_argument("--image-size", type=int, default=None, help="Train at this input size (resized on load); default: the preprocessed size")
+    parser.add_argument("--ema-decay", type=float, default=0.0, help="Exponential moving average of weights, e.g. 0.999 (0 = off)")
+    parser.add_argument("--balance-datasets", type=float, default=0.0, help="Sample slices with weight n_dataset^-p: 0 = natural mix, 1 = each dataset equally often")
     parser.add_argument("--arch", default="dtcr", choices=["dtcr", "dtcr_resnet34"], help="dtcr: paper network; dtcr_resnet34: same design on an ImageNet-pretrained ResNet-34 encoder")
     parser.add_argument("--no-pretrained", action="store_true", help="Do not load ImageNet weights for dtcr_resnet34")
     parser.add_argument("--encoder-lr-mult", type=float, default=0.1, help="Learning-rate factor for the pretrained encoder (default: 0.1)")
@@ -551,6 +573,8 @@ def main():
         num_stages=args.num_stages,
         arch=args.arch,
         image_size=args.image_size,
+        ema_decay=args.ema_decay,
+        balance_power=args.balance_datasets,
         pretrained=not args.no_pretrained,
         encoder_lr_mult=args.encoder_lr_mult,
         tta=not args.no_tta,

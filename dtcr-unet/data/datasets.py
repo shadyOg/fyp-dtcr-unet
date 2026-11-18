@@ -282,6 +282,7 @@ def get_dataloaders(
     seed: int = 42,
     filter_empty_val: bool = False,
     image_size: Optional[int] = None,
+    balance_power: float = 0.0,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Create Train, Val, and Test DataLoaders.
 
@@ -327,6 +328,22 @@ def get_dataloaders(
             batch_sampler=batch_sampler,
             num_workers=num_workers,
             pin_memory=True,
+            worker_init_fn=_seed_worker,
+        )
+    elif balance_power > 0:
+        # Dataset-balanced sampling: each slice is drawn with probability proportional to
+        # n_dataset^-p, so a small source dataset (MosMed) is not drowned out by a large one
+        # (LIDC). p = 1 gives every dataset equal weight, p = 0.5 is a softer square-root balance.
+        counts = {d: train_ds.datasets.count(d) for d in set(train_ds.datasets)}
+        weights = torch.tensor([counts[d] ** -balance_power for d in train_ds.datasets], dtype=torch.double)
+        sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(train_ds), replacement=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=len(train_ds) > batch_size,
             worker_init_fn=_seed_worker,
         )
     else:
